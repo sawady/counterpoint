@@ -1,0 +1,301 @@
+//! The [`Op`] trait: a re-runnable, fallible async computation.
+
+use core::future::Future;
+use core::marker::PhantomData;
+use core::time::Duration;
+
+use crate::breaker::{Breaker, CircuitBreaker, CircuitOpen};
+use crate::par::{Join, Race, Zip};
+use crate::retry::Retry;
+use crate::schedule::Schedule;
+use crate::seq::{AndThen, Ensure, Map, MapErr, Or, OrElse};
+use crate::time::{Elapsed, Timeout};
+
+/// A *description* of a fallible async computation that can be run any number of times.
+///
+/// A Rust [`Future`] is a one-shot value: once polled to completion it is gone. Retrying,
+/// falling back or racing needs something that can produce a *fresh* future on demand, so the
+/// central abstraction of this crate is a re-runnable recipe, much like `IO` in cats-effect or
+/// `ZIO` values in Scala.
+///
+/// Every combinator returns a new `Op`; nothing happens until [`Op::run`] is awaited. The
+/// future returned by `run` borrows the op mutably, so a single op is never run twice
+/// concurrently, and no boxing or `'static` bound is needed.
+///
+/// Dropping the future returned by `run` cancels everything that is in flight inside it
+/// (parallel branches, timers, retries): all combinators are plain state machines that own
+/// their children.
+///
+/// # Example
+///
+/// ```
+/// use counterpoint::prelude::*;
+/// use std::time::Duration;
+///
+/// # #[derive(Debug, PartialEq)] enum MyError { Timeout }
+/// # impl From<Elapsed> for MyError { fn from(_: Elapsed) -> Self { MyError::Timeout } }
+/// # #[tokio::main(flavor = "current_thread")] async fn main() {
+/// let mut price = from_fn(|| async { Ok::<u32, MyError>(42) })
+///     .timeout(Duration::from_millis(200))
+///     .retry(schedule::exponential(Duration::from_millis(10)).take(3));
+///
+/// assert_eq!(price.run().await, Ok(42));
+/// # }
+/// ```
+pub trait Op {
+    /// The success type.
+    type Ok;
+    /// The error type.
+    type Err;
+
+    /// Run the computation once.
+    fn run(&mut self) -> impl Future<Output = Result<Self::Ok, Self::Err>>;
+
+    // ----- functor / monad ------------------------------------------------------------------
+
+    /// Transform the success value.
+    fn map<F, U>(self, f: F) -> Map<Self, F>
+    where
+        Self: Sized,
+        F: FnMut(Self::Ok) -> U,
+    {
+        Map::new(self, f)
+    }
+
+    /// Transform the error value.
+    fn map_err<F, E2>(self, f: F) -> MapErr<Self, F>
+    where
+        Self: Sized,
+        F: FnMut(Self::Err) -> E2,
+    {
+        MapErr::new(self, f)
+    }
+
+    /// Sequential composition: run `self`, then feed its value to `f`. Short-circuits on error.
+    ///
+    /// Laws (monad): `succeed(a).and_then(f) ≡ f(a)`, `m.and_then(succeed) ≡ m`,
+    /// `m.and_then(f).and_then(g) ≡ m.and_then(|x| f(x).and_then(g))`.
+    fn and_then<F, U>(self, f: F) -> AndThen<Self, F>
+    where
+        Self: Sized,
+        F: AsyncFnMut(Self::Ok) -> Result<U, Self::Err>,
+    {
+        AndThen::new(self, f)
+    }
+
+    /// Guard: fail with `err(&value)` unless `pred(&value)` holds.
+    ///
+    /// Laws: `m.ensure(|_| true, e) ≡ m`;
+    /// `m.ensure(p, e).ensure(q, e) ≡ m.ensure(|x| p(x) && q(x), e)`.
+    fn ensure<P, F>(self, pred: P, err: F) -> Ensure<Self, P, F>
+    where
+        Self: Sized,
+        P: FnMut(&Self::Ok) -> bool,
+        F: FnMut(&Self::Ok) -> Self::Err,
+    {
+        Ensure::new(self, pred, err)
+    }
+
+    // ----- alternatives ---------------------------------------------------------------------
+
+    /// Fallback: if `self` fails, run `other` (the first error is discarded).
+    ///
+    /// Laws: associative; `fail(e).or(b) ≡ b`; `succeed(a).or(b) ≡ succeed(a)`.
+    /// There is **no** right identity: `a.or(fail(e))` replaces `a`'s error with `e`.
+    fn or<B>(self, other: B) -> Or<Self, B>
+    where
+        Self: Sized,
+        B: Op<Ok = Self::Ok>,
+    {
+        Or::new(self, other)
+    }
+
+    /// Fallback that sees the error, e.g. to serve a cached value or translate the error.
+    fn or_else<F, E2>(self, f: F) -> OrElse<Self, F>
+    where
+        Self: Sized,
+        F: AsyncFnMut(Self::Err) -> Result<Self::Ok, E2>,
+    {
+        OrElse::new(self, f)
+    }
+
+    // ----- parallel -------------------------------------------------------------------------
+
+    /// Parallel product, fail-fast: run both at once; the first error wins and cancels the
+    /// other branch.
+    ///
+    /// Laws: associative up to tuple re-association, `succeed(())` is a unit up to
+    /// projection, commutative up to swapping the pair; duration is the `max` of both.
+    fn zip<B>(self, other: B) -> Zip<Self, B>
+    where
+        Self: Sized,
+        B: Op<Err = Self::Err>,
+    {
+        Zip::new(self, other)
+    }
+
+    /// Parallel product that waits for both and reports both outcomes. Never fails.
+    fn join<B>(self, other: B) -> Join<Self, B>
+    where
+        Self: Sized,
+        B: Op,
+    {
+        Join::new(self, other)
+    }
+
+    /// Race: run both at once; whichever *finishes* first (success or error) wins and the
+    /// loser is cancelled.
+    ///
+    /// Laws: associative, `never()` is the identity, commutative except on exact ties (ties
+    /// go to the left operand); duration is the `min` of both.
+    fn race<B>(self, other: B) -> Race<Self, B>
+    where
+        Self: Sized,
+        B: Op<Ok = Self::Ok, Err = Self::Err>,
+    {
+        Race::new(self, other)
+    }
+
+    // ----- time & resilience ----------------------------------------------------------------
+
+    /// Fail with [`Elapsed`] (converted into `Self::Err`) if the op takes longer than `limit`.
+    /// The in-flight run is cancelled. `Duration::MAX` means "no limit" and adds no timer.
+    ///
+    /// Laws: `m.timeout(Duration::MAX) ≡ m`;
+    /// `m.timeout(a).timeout(b) ≡ m.timeout(min(a, b))` (except on exact ties).
+    fn timeout(self, limit: Duration) -> Timeout<Self>
+    where
+        Self: Sized,
+        Self::Err: From<Elapsed>,
+    {
+        Timeout::new(self, limit)
+    }
+
+    /// Re-run on failure according to a [`Schedule`].
+    ///
+    /// Laws: `m.retry(schedule::stop()) ≡ m` (and so `m.retry(recurs(0)) ≡ m`);
+    /// `succeed(a).retry(s) ≡ succeed(a)`.
+    fn retry<S>(self, schedule: S) -> Retry<Self, S>
+    where
+        Self: Sized,
+        S: Schedule,
+    {
+        Retry::new(self, schedule)
+    }
+
+    /// Run through a shared [`CircuitBreaker`]. When the breaker is open the op is not run
+    /// and fails with [`CircuitOpen`] (converted into `Self::Err`).
+    fn with_breaker(self, breaker: CircuitBreaker) -> Breaker<Self>
+    where
+        Self: Sized,
+        Self::Err: From<CircuitOpen>,
+    {
+        Breaker::new(self, breaker)
+    }
+}
+
+impl<O: Op + ?Sized> Op for &mut O {
+    type Ok = O::Ok;
+    type Err = O::Err;
+
+    fn run(&mut self) -> impl Future<Output = Result<Self::Ok, Self::Err>> {
+        (**self).run()
+    }
+}
+
+// ----- constructors ---------------------------------------------------------------------------
+
+/// An op built from an async closure (`|| async { .. }` or `async || { .. }`).
+#[derive(Clone)]
+#[must_use = "ops do nothing until `.run().await`"]
+pub struct FromFn<F> {
+    f: F,
+}
+
+/// Lift an async closure into an [`Op`]. The closure is called once per run.
+pub fn from_fn<F, T, E>(f: F) -> FromFn<F>
+where
+    F: AsyncFnMut() -> Result<T, E>,
+{
+    FromFn { f }
+}
+
+impl<F, T, E> Op for FromFn<F>
+where
+    F: AsyncFnMut() -> Result<T, E>,
+{
+    type Ok = T;
+    type Err = E;
+
+    fn run(&mut self) -> impl Future<Output = Result<T, E>> {
+        (self.f)()
+    }
+}
+
+/// An op that immediately succeeds with a clone of the value. See [`succeed`].
+#[must_use = "ops do nothing until `.run().await`"]
+pub struct Succeed<T, E> {
+    value: T,
+    _err: PhantomData<fn() -> E>,
+}
+
+/// The op that succeeds immediately with `value` (the `pure`/`return` of the monad).
+pub fn succeed<T: Clone, E>(value: T) -> Succeed<T, E> {
+    Succeed {
+        value,
+        _err: PhantomData,
+    }
+}
+
+impl<T: Clone, E> Op for Succeed<T, E> {
+    type Ok = T;
+    type Err = E;
+
+    async fn run(&mut self) -> Result<T, E> {
+        Ok(self.value.clone())
+    }
+}
+
+/// An op that immediately fails with a clone of the error. See [`fail`].
+#[must_use = "ops do nothing until `.run().await`"]
+pub struct Fail<T, E> {
+    error: E,
+    _ok: PhantomData<fn() -> T>,
+}
+
+/// The op that fails immediately with `error`. Left identity of [`Op::or`].
+pub fn fail<T, E: Clone>(error: E) -> Fail<T, E> {
+    Fail {
+        error,
+        _ok: PhantomData,
+    }
+}
+
+impl<T, E: Clone> Op for Fail<T, E> {
+    type Ok = T;
+    type Err = E;
+
+    async fn run(&mut self) -> Result<T, E> {
+        Err(self.error.clone())
+    }
+}
+
+/// An op that never completes. See [`never()`](fn@crate::never).
+#[must_use = "ops do nothing until `.run().await`"]
+pub struct Never<T, E> {
+    _t: PhantomData<fn() -> (T, E)>,
+}
+
+/// The op that never completes: identity of [`Op::race`].
+pub fn never<T, E>() -> Never<T, E> {
+    Never { _t: PhantomData }
+}
+
+impl<T, E> Op for Never<T, E> {
+    type Ok = T;
+    type Err = E;
+
+    async fn run(&mut self) -> Result<T, E> {
+        core::future::pending().await
+    }
+}
