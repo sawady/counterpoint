@@ -1,6 +1,7 @@
 # counterpoint
 
 [![CI](https://github.com/sawady/counterpoint/actions/workflows/ci.yml/badge.svg)](https://github.com/sawady/counterpoint/actions/workflows/ci.yml)
+[![Sponsor](https://img.shields.io/github/sponsors/sawady?label=Sponsor&logo=GitHub)](https://github.com/sponsors/sawady)
 
 **Lawful combinators for orchestrating async Rust.**
 
@@ -139,6 +140,11 @@ Build ops with `from_fn(|| async { .. })` (any async closure), `succeed(v)`, `fa
 
 Issues are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in
 [CHANGELOG.md](CHANGELOG.md).
+
+## Sponsoring
+
+counterpoint is free software. If it is useful to you, you can support its development through
+[GitHub Sponsors](https://github.com/sponsors/sawady).
 
 ## License
 
