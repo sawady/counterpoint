@@ -1,5 +1,7 @@
 # counterpoint
 
+[![CI](https://github.com/sawady/counterpoint/actions/workflows/ci.yml/badge.svg)](https://github.com/sawady/counterpoint/actions/workflows/ci.yml)
+
 **Lawful combinators for orchestrating async Rust.**
 
 In musical counterpoint, independent voices are combined under strict rules. `counterpoint`
@@ -38,6 +40,18 @@ let ((profile, config), recs) = dashboard.run().await?;
 
 A complete, runnable version lives in [`examples/dashboard.rs`](examples/dashboard.rs)
 (`cargo run --example dashboard`).
+
+## Installation
+
+counterpoint is not on crates.io yet. To try it, depend on the git repository:
+
+```toml
+[dependencies]
+counterpoint = { git = "https://github.com/sawady/counterpoint" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+```
+
+It needs Rust 1.88 or newer and runs on [tokio](https://tokio.rs).
 
 ## Why another one?
 
@@ -120,6 +134,11 @@ Build ops with `from_fn(|| async { .. })` (any async closure), `succeed(v)`, `fa
 ## Minimum supported Rust version
 
 1.88 (async closures and let-chains, edition 2024).
+
+## Contributing
+
+Issues are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
