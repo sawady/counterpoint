@@ -40,5 +40,7 @@ CI runs all of the above on stable and on 1.88, with warnings denied
 
 ## License
 
-By contributing you agree that your contributions are licensed under the terms in
-[LICENSE](LICENSE).
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in the work by you, as defined in the Apache-2.0 license, shall be dual licensed under
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), without any additional terms or
+conditions.

@@ -4,14 +4,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Lawful combinators for orchestrating async Rust: parallel, race, timeout, retry schedules, fallback, bounded concurrency and circuit breaking, with algebraic laws checked by property tests."
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/sawady/counterpoint"
 readme = "README.md"
+documentation = "https://docs.rs/counterpoint"
 keywords = ["async", "retry", "timeout", "combinators", "resilience"]
 categories = ["asynchronous", "concurrency"]
+exclude = [".github/"]
 authors = ["Federico Sawady"]
-# Private until the publication checklist is done (see oss-hq decision 0001).
-publish = false
 
 [dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
@@ -24,3 +24,6 @@ tracing = ["dep:tracing"]
 [dev-dependencies]
 proptest = "1.12.0"
 tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true

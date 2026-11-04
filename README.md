@@ -11,7 +11,7 @@ happen — in sequence, in parallel, as a race, with timeouts, retries, fallback
 with a small set of combinators whose behaviour is pinned down by **algebraic laws**, and every
 law is checked by property-based tests on tokio's virtual clock.
 
-> Status: early prototype, not published on crates.io. The API will change.
+> Status: early release (0.1). The API may still change between 0.x versions.
 
 ```rust
 use counterpoint::prelude::*;
@@ -44,13 +44,14 @@ A complete, runnable version lives in [`examples/dashboard.rs`](examples/dashboa
 
 ## Installation
 
-counterpoint is not on crates.io yet. To try it, depend on the git repository:
-
 ```toml
 [dependencies]
-counterpoint = { git = "https://github.com/sawady/counterpoint" }
+counterpoint = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
+
+Or `cargo add counterpoint`. With the optional `tracing` feature, every retry, timeout,
+fallback and breaker transition is emitted as a `tracing` debug event.
 
 It needs Rust 1.88 or newer and runs on [tokio](https://tokio.rs).
 
@@ -148,4 +149,14 @@ counterpoint is free software. If it is useful to you, you can support its devel
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
+in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.
