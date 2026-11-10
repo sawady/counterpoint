@@ -277,6 +277,76 @@ proptest! {
         prop_assert_eq!(calls.get(), (m + 1) * (n + 1));
     }
 
+    // ----- flat products ----------------------------------------------------------------
+
+    #[test]
+    fn zip3_is_nested_zip(a in leaf(), b in leaf(), c in leaf()) {
+        same(
+            zip3(a.op(), b.op(), c.op()),
+            a.op().zip(b.op()).zip(c.op()).map(|((x, y), z)| (x, y, z)),
+        )?;
+    }
+
+    #[test]
+    fn zip4_extends_zip3(a in leaf(), b in leaf(), c in leaf(), d in leaf()) {
+        same(
+            zip4(a.op(), b.op(), c.op(), d.op()),
+            zip3(a.op(), b.op(), c.op()).zip(d.op()).map(|((x, y, z), w)| (x, y, z, w)),
+        )?;
+    }
+
+    #[test]
+    fn zip5_extends_zip4(a in leaf(), b in leaf(), c in leaf(), d in leaf(), e in leaf()) {
+        same(
+            zip5(a.op(), b.op(), c.op(), d.op(), e.op()),
+            zip4(a.op(), b.op(), c.op(), d.op()).zip(e.op()).map(|((x, y, z, w), v)| (x, y, z, w, v)),
+        )?;
+    }
+
+    #[test]
+    fn zip6_extends_zip5(a in leaf(), b in leaf(), c in leaf(), d in leaf(), e in leaf(), f in leaf()) {
+        same(
+            zip6(a.op(), b.op(), c.op(), d.op(), e.op(), f.op()),
+            zip5(a.op(), b.op(), c.op(), d.op(), e.op()).zip(f.op())
+                .map(|((x, y, z, w, v), u)| (x, y, z, w, v, u)),
+        )?;
+    }
+
+    #[test]
+    fn zip7_extends_zip6(a in leaf(), b in leaf(), c in leaf(), d in leaf(), e in leaf(), f in leaf(), g in leaf()) {
+        same(
+            zip7(a.op(), b.op(), c.op(), d.op(), e.op(), f.op(), g.op()),
+            zip6(a.op(), b.op(), c.op(), d.op(), e.op(), f.op()).zip(g.op())
+                .map(|((x, y, z, w, v, u), t)| (x, y, z, w, v, u, t)),
+        )?;
+    }
+
+    #[test]
+    fn zip8_extends_zip7(a in leaf(), b in leaf(), c in leaf(), d in leaf(), e in leaf(), f in leaf(), g in leaf(), h in leaf()) {
+        same(
+            zip8(a.op(), b.op(), c.op(), d.op(), e.op(), f.op(), g.op(), h.op()),
+            zip7(a.op(), b.op(), c.op(), d.op(), e.op(), f.op(), g.op()).zip(h.op())
+                .map(|((x, y, z, w, v, u, t), s)| (x, y, z, w, v, u, t, s)),
+        )?;
+    }
+
+    #[test]
+    fn zip3_takes_the_max_and_fails_fast(a in leaf(), b in leaf(), c in leaf()) {
+        let leaves = [a, b, c];
+        let (r, t) = observe(zip3(a.op(), b.op(), c.op()));
+        let first_failure = leaves.iter().filter(|l| !l.ok()).map(|l| l.delay_ms).min();
+        match first_failure {
+            None => {
+                prop_assert_eq!(r, Ok((a.result.unwrap(), b.result.unwrap(), c.result.unwrap())));
+                prop_assert_eq!(t, ms(leaves.iter().map(|l| l.delay_ms).max().unwrap()));
+            }
+            Some(d) => {
+                prop_assert!(r.is_err());
+                prop_assert_eq!(t, ms(d));
+            }
+        }
+    }
+
     // ----- retry with input --------------------------------------------------------------
 
     #[test]

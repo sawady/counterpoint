@@ -5,7 +5,9 @@
 //! dropping the outer future cancels every branch.
 
 use core::convert::Infallible;
+use core::future::{Future, poll_fn};
 use core::pin::pin;
+use core::task::{Context, Poll};
 
 use futures_util::future::{self, Either};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -37,6 +39,85 @@ where
     async fn run(&mut self) -> Result<(A::Ok, B::Ok), A::Err> {
         future::try_join(self.a.run(), self.b.run()).await
     }
+}
+
+macro_rules! zip_arity {
+    ($(#[$doc:meta])* $name:ident $ctor:ident: $A:ident $a:ident $(, $T:ident $t:ident)+) => {
+        /// A flat parallel product of ops: see the function of the same name in lowercase.
+        #[derive(Clone)]
+        #[must_use = "ops do nothing until `.run().await`"]
+        pub struct $name<$A, $($T),+> {
+            $a: $A,
+            $($t: $T,)+
+        }
+
+        $(#[$doc])*
+        #[allow(clippy::too_many_arguments)]
+        pub fn $ctor<$A, $($T),+>($a: $A, $($t: $T),+) -> $name<$A, $($T),+>
+        where
+            $A: Op,
+            $($T: Op<Err = $A::Err>,)+
+        {
+            $name { $a, $($t),+ }
+        }
+
+        impl<$A, $($T),+> Op for $name<$A, $($T),+>
+        where
+            $A: Op,
+            $($T: Op<Err = $A::Err>,)+
+        {
+            type Ok = ($A::Ok, $($T::Ok),+);
+            type Err = $A::Err;
+
+            async fn run(&mut self) -> Result<Self::Ok, $A::Err> {
+                let mut $a = pin!(future::try_maybe_done(self.$a.run()));
+                $(let mut $t = pin!(future::try_maybe_done(self.$t.run()));)+
+                poll_fn(move |cx: &mut Context<'_>| -> Poll<Result<Self::Ok, $A::Err>> {
+                    let mut done = $a.as_mut().poll(cx)?.is_ready();
+                    $(done &= $t.as_mut().poll(cx)?.is_ready();)+
+                    if !done {
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Ok((
+                        $a.as_mut().take_output().expect("polled to completion"),
+                        $($t.as_mut().take_output().expect("polled to completion"),)+
+                    )))
+                })
+                .await
+            }
+        }
+    };
+}
+
+zip_arity! {
+    /// Parallel product of 3 ops with a flat result, fail-fast like [`Op::zip`].
+    /// Law: `zip3(a, b, c) ≡ a.zip(b).zip(c).map(|((a, b), c)| (a, b, c))`.
+    Zip3 zip3: A a, B b, C c
+}
+zip_arity! {
+    /// Parallel product of 4 ops with a flat result, fail-fast like [`Op::zip`].
+    /// Law: `zip4(a, b, c, d) ≡ zip3(a, b, c).zip(d)`, flattened.
+    Zip4 zip4: A a, B b, C c, D d
+}
+zip_arity! {
+    /// Parallel product of 5 ops with a flat result, fail-fast like [`Op::zip`].
+    /// Law: `zip5(.., e) ≡ zip4(..).zip(e)`, flattened.
+    Zip5 zip5: A a, B b, C c, D d, E e
+}
+zip_arity! {
+    /// Parallel product of 6 ops with a flat result, fail-fast like [`Op::zip`].
+    /// Law: `zip6(.., f) ≡ zip5(..).zip(f)`, flattened.
+    Zip6 zip6: A a, B b, C c, D d, E e, F f
+}
+zip_arity! {
+    /// Parallel product of 7 ops with a flat result, fail-fast like [`Op::zip`].
+    /// Law: `zip7(.., g) ≡ zip6(..).zip(g)`, flattened.
+    Zip7 zip7: A a, B b, C c, D d, E e, F f, G g
+}
+zip_arity! {
+    /// Parallel product of 8 ops with a flat result, fail-fast like [`Op::zip`].
+    /// Law: `zip8(.., h) ≡ zip7(..).zip(h)`, flattened.
+    Zip8 zip8: A a, B b, C c, D d, E e, F f, G g, H h
 }
 
 /// See [`Op::join`].

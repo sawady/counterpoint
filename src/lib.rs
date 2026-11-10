@@ -46,6 +46,7 @@
 //! | [`Op::and_then`] | `succeed(a).and_then(f) ≡ f(a)`; `m.and_then(succeed) ≡ m`; associativity; duration adds |
 //! | [`Op::map`] | `m.map(id) ≡ m`; `m.map(f).map(g) ≡ m.map(g ∘ f)` |
 //! | [`Op::zip`] | associative and commutative up to tuple isomorphism; unit `succeed(())`; duration is `max` |
+//! | [`zip3`]…[`zip8`] | each is the previous arity zipped with one more op and flattened |
 //! | [`Op::race`] | associative; identity [`never()`](fn@crate::never); commutative except on ties; duration is `min` |
 //! | [`Op::or`] | associative; left identity `fail(e)`; left zero `succeed(a)` |
 //! | [`Op::ensure`] | `ensure(true) ≡ id`; `ensure(p).ensure(q) ≡ ensure(p ∧ q)` |
@@ -74,7 +75,7 @@ pub mod time;
 
 pub use breaker::{BreakerState, CircuitBreaker, CircuitOpen};
 pub use op::{Fail, FromFn, Never, Op, Succeed, fail, from_fn, never, succeed};
-pub use par::{all, race_all};
+pub use par::{all, race_all, zip3, zip4, zip5, zip6, zip7, zip8};
 pub use schedule::{Schedule, ScheduleFor};
 pub use time::Elapsed;
 
@@ -82,7 +83,7 @@ pub use time::Elapsed;
 pub mod prelude {
     pub use crate::breaker::{BreakerState, CircuitBreaker, CircuitOpen};
     pub use crate::op::{Op, fail, from_fn, never, succeed};
-    pub use crate::par::{all, race_all};
+    pub use crate::par::{all, race_all, zip3, zip4, zip5, zip6, zip7, zip8};
     pub use crate::schedule::{self, Schedule, ScheduleFor};
     pub use crate::time::Elapsed;
 }

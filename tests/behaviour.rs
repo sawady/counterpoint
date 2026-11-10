@@ -241,6 +241,20 @@ async fn dropping_a_repeat_mid_delay_stops_it() {
     assert_eq!(calls.get(), 3);
 }
 
+#[tokio::test(start_paused = true)]
+async fn zip3_fails_fast_and_cancels_the_siblings() {
+    let (b, c) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+    let mut op = zip3(
+        cancellable(5, Err(TErr::Code(4)), Rc::default()),
+        cancellable(100, Ok(1), b.clone()),
+        cancellable(100, Ok(2), c.clone()),
+    );
+    let t0 = Instant::now();
+    assert_eq!(op.run().await, Err(TErr::Code(4)));
+    assert_eq!(t0.elapsed(), ms(5));
+    assert!(b.get() && c.get());
+}
+
 // ----- Send -----------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
