@@ -306,4 +306,86 @@ proptest! {
         let waits: u64 = codes[..n - 1].iter().map(|c| factor * u64::from(*c)).sum();
         prop_assert_eq!(t, ms(n as u64 * d + waits));
     }
+
+    // ----- repeat -----------------------------------------------------------------------
+
+    #[test]
+    fn repeat_stop_is_identity(a in leaf()) {
+        same(a.op().repeat(schedule::stop()), a.op())?;
+        same(a.op().repeat(schedule::recurs(0)), a.op())?;
+    }
+
+    #[test]
+    fn repeat_never_reruns_a_failure(a in leaf(), n in 0u32..5) {
+        let failing = Leaf { result: Err(TErr::Code(1)), ..a };
+        same(failing.op().repeat(schedule::recurs(n)), failing.op())?;
+        same(fail::<i32, TErr>(TErr::Code(2)).repeat(schedule::recurs(n)), fail(TErr::Code(2)))?;
+    }
+
+    #[test]
+    fn repeat_is_retry_with_outcomes_swapped(script in prop::collection::vec(leaf(), 1..6), n in 0u32..6, gap in 0u64..20) {
+        let s = schedule::spaced(ms(gap)) & schedule::recurs(n);
+        let (lhs, lhs_calls) = scripted(script.clone());
+        let (rhs, rhs_calls) = scripted(script);
+        let (l, lt) = observe(lhs.repeat(s));
+        let (r, rt) = observe(Flip(rhs).retry(s));
+        let flipped = match r {
+            Ok(e) => Err(e),
+            Err(v) => Ok(v),
+        };
+        prop_assert_eq!((l, lt), (flipped, rt));
+        prop_assert_eq!(lhs_calls.get(), rhs_calls.get());
+    }
+
+    #[test]
+    fn repeat_runs_n_plus_one_times_and_returns_the_last_value(n in 0u32..8, d in 0u64..20, gap in 0u64..20) {
+        let script: Vec<_> = (0..=n as i32).map(|v| Leaf { delay_ms: d, result: Ok(v) }).collect();
+        let (op, calls) = scripted(script);
+        let (r, t) = observe(op.repeat(schedule::spaced(ms(gap)) & schedule::recurs(n)));
+        prop_assert_eq!(r, Ok(n as i32));
+        prop_assert_eq!(calls.get(), n as usize + 1);
+        let c = u64::from(n) + 1;
+        prop_assert_eq!(t, ms(c * d + (c - 1) * gap));
+    }
+
+    #[test]
+    fn repeat_stops_at_the_first_error(oks in 0usize..5, extra in 0u32..5, code in 0u8..5) {
+        let mut script = vec![Leaf { delay_ms: 1, result: Ok(0) }; oks];
+        script.push(Leaf { delay_ms: 1, result: Err(TErr::Code(code)) });
+        let (op, calls) = scripted(script);
+        let (r, _) = observe(op.repeat(schedule::recurs(oks as u32 + extra)));
+        prop_assert_eq!(r, Err(TErr::Code(code)));
+        prop_assert_eq!(calls.get(), oks + 1);
+    }
+
+    #[test]
+    fn nested_repeats_multiply(m in 0u32..4, n in 0u32..4) {
+        let (op, calls) = scripted(vec![Leaf { delay_ms: 1, result: Ok(1) }]);
+        let _ = observe(op.repeat(schedule::recurs(m)).repeat(schedule::recurs(n)));
+        prop_assert_eq!(calls.get() as u32, (m + 1) * (n + 1));
+    }
+
+    #[test]
+    fn repeat_then_adds(a in leaf(), m in 0u32..4, n in 0u32..4) {
+        same(
+            a.op().repeat(schedule::recurs(m).then(schedule::recurs(n))),
+            a.op().repeat(schedule::recurs(m + n)),
+        )?;
+    }
+
+    #[test]
+    fn repeat_until_is_polling(values in prop::collection::vec(0i32..20, 1..8), goal in 0i32..20, d in 0u64..10, gap in 0u64..10) {
+        let script: Vec<_> = values.iter().map(|v| Leaf { delay_ms: d, result: Ok(*v) }).collect();
+        let (op, calls) = scripted(script);
+        let done = move |v: &i32| *v >= goal;
+        let limit = values.len() as u32 - 1;
+        let s = schedule::spaced(ms(gap)) & schedule::recur_until(done) & schedule::recurs(limit);
+        let (r, t) = observe(op.repeat(s));
+        let hit = values.iter().position(done);
+        let runs = hit.map_or(values.len(), |i| i + 1);
+        prop_assert_eq!(r, Ok(values[runs - 1]));
+        prop_assert_eq!(calls.get(), runs);
+        let c = runs as u64;
+        prop_assert_eq!(t, ms(c * d + (c - 1) * gap));
+    }
 }

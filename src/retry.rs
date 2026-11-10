@@ -1,4 +1,5 @@
-//! Retrying an [`Op`] according to a [`Schedule`](crate::schedule::Schedule).
+//! Re-running an [`Op`] according to a [`Schedule`](crate::schedule::Schedule): on failure with [`Retry`], on success with
+//! [`Repeat`].
 
 use core::time::Duration;
 
@@ -130,6 +131,51 @@ where
             self.hook.on_retry(&err, attempt, delay);
             crate::obs::event!("counterpoint.retry: retry {} in {:?}", attempt, delay);
             drop(err);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// See [`Op::repeat`].
+#[derive(Clone)]
+#[must_use = "ops do nothing until `.run().await`"]
+pub struct Repeat<O, S> {
+    op: O,
+    schedule: S,
+}
+
+impl<O, S> Repeat<O, S> {
+    pub(crate) fn new(op: O, schedule: S) -> Self {
+        Repeat { op, schedule }
+    }
+}
+
+impl<O, S> Op for Repeat<O, S>
+where
+    O: Op,
+    S: ScheduleFor<O::Ok>,
+{
+    type Ok = O::Ok;
+    type Err = O::Err;
+
+    async fn run(&mut self) -> Result<O::Ok, O::Err> {
+        let start = Instant::now();
+        let mut schedule = self.schedule.fresh();
+        let mut attempt: u32 = 0;
+        loop {
+            let value = self.op.run().await?;
+            let step = Step {
+                attempt,
+                elapsed: start.elapsed(),
+            };
+            let Some(delay) = schedule.next(&value, step) else {
+                return Ok(value);
+            };
+            attempt = attempt.saturating_add(1);
+            crate::obs::event!("counterpoint.repeat: repetition {} in {:?}", attempt, delay);
+            drop(value);
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }

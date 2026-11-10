@@ -6,7 +6,7 @@ use core::time::Duration;
 
 use crate::breaker::{Breaker, CircuitBreaker, CircuitOpen};
 use crate::par::{Join, Race, Zip};
-use crate::retry::Retry;
+use crate::retry::{Repeat, Retry};
 use crate::schedule::ScheduleFor;
 use crate::seq::{AndThen, Ensure, Map, MapErr, Or, OrElse};
 use crate::time::{Elapsed, Timeout};
@@ -182,6 +182,21 @@ pub trait Op {
         S: ScheduleFor<Self::Err>,
     {
         Retry::new(self, schedule)
+    }
+
+    /// Run again after each *success* according to a [`Schedule`](crate::schedule::Schedule), until the schedule stops or
+    /// a run fails. Returns the last value, or the first error. The schedule sees each value,
+    /// so polling is `op.repeat(spaced(d) & recur_until(|v: &V| v.is_done()))`.
+    ///
+    /// Laws: `m.repeat(schedule::stop()) ≡ m`; `fail(e).repeat(s) ≡ fail(e)`;
+    /// `repeat` is `retry` with success and failure swapped;
+    /// `m.repeat(recurs(a)).repeat(recurs(b))` runs `m` `(a + 1)(b + 1)` times.
+    fn repeat<S>(self, schedule: S) -> Repeat<Self, S>
+    where
+        Self: Sized,
+        S: ScheduleFor<Self::Ok>,
+    {
+        Repeat::new(self, schedule)
     }
 
     /// Run through a shared [`CircuitBreaker`]. When the breaker is open the op is not run

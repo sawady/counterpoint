@@ -228,6 +228,19 @@ async fn half_open_admits_a_single_probe_and_cancelled_probes_release_it() {
 
 // ----- repeat, hedge, flat products --------------------------------------------------------------
 
+#[tokio::test(start_paused = true)]
+async fn dropping_a_repeat_mid_delay_stops_it() {
+    let (op, calls) = scripted(vec![Leaf {
+        delay_ms: 1,
+        result: Ok(1),
+    }]);
+    let mut op = op.repeat(schedule::spaced(ms(100)));
+    assert!(tokio::time::timeout(ms(250), op.run()).await.is_err());
+    assert_eq!(calls.get(), 3); // runs at t=0, 101, 202
+    sleep(ms(1000)).await;
+    assert_eq!(calls.get(), 3);
+}
+
 // ----- Send -----------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
