@@ -210,6 +210,9 @@ pub trait Op {
     /// op must be [`Clone`]. A schedule that never stops launches copies until one succeeds:
     /// bound it, as in `spaced(d).take(2)`.
     ///
+    /// Every error is worth hedging past by default; [`Hedge::when`](crate::par::Hedge::when)
+    /// makes the others final.
+    ///
     /// Laws: `m.hedge(schedule::stop()) ≡ m`; `succeed(a).hedge(s) ≡ succeed(a)`; a success is
     /// never slower than the primary's; for attempts that succeed, one hedge after `d` is a
     /// `race` against the second attempt delayed by `d`.
@@ -223,6 +226,9 @@ pub trait Op {
 
     /// Run through a shared [`CircuitBreaker`]. When the breaker is open the op is not run
     /// and fails with [`CircuitOpen`] (converted into `Self::Err`).
+    ///
+    /// Every error counts as a failure by default;
+    /// [`Breaker::when`](crate::breaker::Breaker::when) picks the ones that do.
     fn with_breaker<S>(self, breaker: CircuitBreaker<S>) -> Breaker<Self, S>
     where
         Self: Sized,

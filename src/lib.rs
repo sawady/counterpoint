@@ -53,7 +53,8 @@
 //! | [`Op::timeout`] | `timeout(∞) ≡ id`; `timeout(a).timeout(b) ≡ timeout(min(a, b))` except on ties |
 //! | [`Op::retry`] | `retry(stop) ≡ id`; `succeed(a).retry(s) ≡ succeed(a)`; `retry(recurs(n))` runs at most `n + 1` times |
 //! | [`Op::repeat`] | `repeat(stop) ≡ id`; `fail(e).repeat(s) ≡ fail(e)`; `repeat` is `retry` with success and failure swapped |
-//! | [`Op::hedge`] | `hedge(stop) ≡ id`; `succeed(a).hedge(s) ≡ succeed(a)`; a success is never slower than the primary's |
+//! | [`Op::hedge`] | `hedge(stop) ≡ id`; `succeed(a).hedge(s) ≡ succeed(a)`; a success is never slower than the primary's; with `.when(|_| false)` the first attempt to finish wins |
+//! | [`Op::with_breaker`] | `with_schedule(n, spaced(d)) ≡ new(n, d)`; `.when(|_| true) ≡` no filter; errors that `.when` does not count are invisible to the breaker |
 //! | [`Schedule`] | `\|`/`&` form a distributive lattice (min/max of delays) with `stop`/`forever` as bounds; `then` is a monoid with unit `stop` |
 //!
 //! See `tests/laws.rs` and `tests/schedule_laws.rs` for the executable versions.

@@ -7,6 +7,9 @@
 //! Cancelling a probe (dropping its future) releases the half-open slot, so a cancelled probe
 //! never wedges the breaker.
 //!
+//! By default every error counts as a failure. [`Breaker::when`] picks the ones that do: the
+//! others are neutral, as if the call had not been made.
+//!
 //! The cool-down is a [`Schedule`](crate::schedule::Schedule): [`CircuitBreaker::new`] uses a
 //! fixed one and [`CircuitBreaker::with_schedule`] accepts any, so a breaker can back off while
 //! a dependency stays down.
@@ -18,7 +21,37 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::time::Instant;
 
 use crate::op::Op;
+use crate::retry::Always;
 use crate::schedule::{self, ScheduleFor, Spaced, Step};
+
+/// Decides whether an error counts as a failure for the breaker. Implemented by
+/// [`Always`] (every error counts, the default) and by any
+/// `FnMut(&E) -> bool`.
+pub trait CountIf<E> {
+    /// `true` if `error` is a failure of the dependency, `false` to leave the breaker as it was.
+    fn counts(&mut self, error: &E) -> bool;
+}
+
+impl<E> CountIf<E> for Always {
+    fn counts(&mut self, _: &E) -> bool {
+        true
+    }
+}
+
+impl<E, F: FnMut(&E) -> bool> CountIf<E> for F {
+    fn counts(&mut self, error: &E) -> bool {
+        self(error)
+    }
+}
+
+/// How a call through the breaker ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Success,
+    Failure,
+    /// An error that does not count: neither a success nor a failure.
+    Ignored,
+}
 
 /// Error returned when the breaker rejects a call. Convert it into your error type with
 /// `From`.
@@ -207,11 +240,16 @@ struct Permit<'a, S> {
 }
 
 impl<S: ScheduleFor<()>> Permit<'_, S> {
-    fn settle(mut self, success: bool) {
+    fn settle(mut self, outcome: Outcome) {
+        if outcome == Outcome::Ignored {
+            // Leave the state as it was; dropping the permit gives a probe's slot back, exactly
+            // as when the probe is cancelled.
+            return;
+        }
         self.settled = true;
         let mut guard = self.breaker.lock();
         let inner = &mut *guard;
-        match (&mut inner.state, success) {
+        match (&mut inner.state, outcome == Outcome::Success) {
             (State::Closed { failures }, true) => *failures = 0,
             (State::Closed { failures }, false) => {
                 *failures += 1;
@@ -240,31 +278,77 @@ impl<S> Drop for Permit<'_, S> {
 
 /// See [`Op::with_breaker`].
 #[must_use = "ops do nothing until `.run().await`"]
-pub struct Breaker<O, S = Spaced> {
+pub struct Breaker<O, S = Spaced, W = Always> {
     op: O,
     breaker: CircuitBreaker<S>,
+    when: W,
 }
 
-impl<O: Clone, S> Clone for Breaker<O, S> {
+impl<O: Clone, S, W: Clone> Clone for Breaker<O, S, W> {
     fn clone(&self) -> Self {
         Breaker {
             op: self.op.clone(),
             breaker: self.breaker.clone(),
+            when: self.when.clone(),
         }
     }
 }
 
 impl<O, S> Breaker<O, S> {
     pub(crate) fn new(op: O, breaker: CircuitBreaker<S>) -> Self {
-        Breaker { op, breaker }
+        Breaker {
+            op,
+            breaker,
+            when: Always,
+        }
     }
 }
 
-impl<O, S> Op for Breaker<O, S>
+impl<O, S, W> Breaker<O, S, W> {
+    /// Only count errors for which `pred` returns `true` as failures. The others are neutral:
+    /// they do not add to the consecutive failures, do not reset them, and a probe that ends
+    /// with one gives its half-open slot back, so the next call is the probe. Use it for errors
+    /// that say nothing about the health of the dependency, such as a rejected request.
+    ///
+    /// The classification belongs to the op, not to the breaker: ops sharing a breaker may
+    /// classify differently. Rejections with [`CircuitOpen`] are not seen by `pred`.
+    ///
+    /// Laws: `.when(|_| true) ≡` no filter; with `.when(|_| false)` a closed breaker never
+    /// opens; removing the calls that end with an uncounted error from a trace changes nothing
+    /// for the other calls.
+    ///
+    /// ```
+    /// use counterpoint::prelude::*;
+    /// use std::time::Duration;
+    ///
+    /// #[derive(Debug, Clone, PartialEq)]
+    /// enum Error { Unavailable, BadRequest, Open }
+    /// impl From<CircuitOpen> for Error { fn from(_: CircuitOpen) -> Self { Error::Open } }
+    ///
+    /// # #[tokio::main(flavor = "current_thread")] async fn main() {
+    /// let breaker = CircuitBreaker::new(1, Duration::from_secs(10));
+    /// let mut call = from_fn(|| async { Err::<(), _>(Error::BadRequest) })
+    ///     .with_breaker(breaker.clone())
+    ///     .when(|e: &Error| *e == Error::Unavailable);
+    /// assert_eq!(call.run().await, Err(Error::BadRequest));
+    /// assert_eq!(breaker.state(), BreakerState::Closed);
+    /// # }
+    /// ```
+    pub fn when<P>(self, pred: P) -> Breaker<O, S, P> {
+        Breaker {
+            op: self.op,
+            breaker: self.breaker,
+            when: pred,
+        }
+    }
+}
+
+impl<O, S, W> Op for Breaker<O, S, W>
 where
     O: Op,
     O::Err: From<CircuitOpen>,
     S: ScheduleFor<()>,
+    W: CountIf<O::Err>,
 {
     type Ok = O::Ok;
     type Err = O::Err;
@@ -272,7 +356,12 @@ where
     async fn run(&mut self) -> Result<O::Ok, O::Err> {
         let permit = self.breaker.acquire()?;
         let result = self.op.run().await;
-        permit.settle(result.is_ok());
+        let outcome = match &result {
+            Ok(_) => Outcome::Success,
+            Err(e) if self.when.counts(e) => Outcome::Failure,
+            Err(_) => Outcome::Ignored,
+        };
+        permit.settle(outcome);
         result
     }
 }

@@ -12,16 +12,40 @@ use counterpoint::schedule::Step;
 use proptest::prelude::*;
 use tokio::time::sleep;
 
-/// One call of the trace: wait `gap_ms`, then make a call that fails or succeeds at once.
+/// What a call of the trace does once admitted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Kind {
+    Ok,
+    /// Fails with `COUNTED`.
+    Fail,
+    /// Fails with `IGNORED`, which the classifying breaker does not count.
+    Ignored,
+}
+
+const COUNTED: TErr = TErr::Code(1);
+const IGNORED: TErr = TErr::Code(2);
+
+/// One call of the trace: wait `gap_ms`, then make a call that ends at once.
 #[derive(Debug, Clone, Copy)]
 struct Call {
     gap_ms: u64,
-    ok: bool,
+    kind: Kind,
+}
+
+impl Call {
+    fn outcome(self) -> Out {
+        match self.kind {
+            Kind::Ok => Ok(1),
+            Kind::Fail => Err(COUNTED),
+            Kind::Ignored => Err(IGNORED),
+        }
+    }
 }
 
 fn calls() -> impl Strategy<Value = Vec<Call>> {
+    let kind = prop_oneof![4 => Just(Kind::Ok), 4 => Just(Kind::Fail), 2 => Just(Kind::Ignored)];
     prop::collection::vec(
-        (0u64..120, prop::bool::weighted(0.4)).prop_map(|(gap_ms, ok)| Call { gap_ms, ok }),
+        (0u64..120, kind).prop_map(|(gap_ms, kind)| Call { gap_ms, kind }),
         1..30,
     )
 }
@@ -29,30 +53,62 @@ fn calls() -> impl Strategy<Value = Vec<Call>> {
 /// `(outcome of the call, state right after it)` for every call of the trace.
 type Observed = Vec<(Out, BreakerState)>;
 
-fn replay<S: ScheduleFor<()>>(b: CircuitBreaker<S>, trace: &[Call]) -> Observed {
-    on_virtual_clock(async {
-        let outcome: Rc<Cell<Out>> = Rc::new(Cell::new(Ok(0)));
-        let o = outcome.clone();
-        let mut op = from_fn(move || {
-            let o = o.clone();
-            async move { o.get() }
-        })
-        .with_breaker(b.clone());
-        let mut out = Vec::new();
-        for call in trace {
-            sleep(ms(call.gap_ms)).await;
-            outcome.set(if call.ok { Ok(1) } else { Err(TErr::Code(1)) });
-            let r = op.run().await;
-            out.push((r, b.state()));
+/// How the op under test classifies its errors for the breaker.
+#[derive(Debug, Clone, Copy)]
+enum Filter {
+    /// Plain `with_breaker`: every error counts.
+    None,
+    /// `.when(|_| true)`.
+    CountAll,
+    /// `.when(|_| false)`.
+    CountNone,
+    /// `.when(|e| *e != IGNORED)`.
+    SkipIgnored,
+}
+
+fn replay<S: ScheduleFor<()>>(b: CircuitBreaker<S>, trace: &[Call], filter: Filter) -> Observed {
+    let outcome: Rc<Cell<Out>> = Rc::new(Cell::new(Ok(0)));
+    let o = outcome.clone();
+    let op = from_fn(move || {
+        let o = o.clone();
+        async move { o.get() }
+    });
+    let handle = b.clone();
+    on_virtual_clock(async move {
+        let guarded = op.with_breaker(handle);
+        match filter {
+            Filter::None => drive(guarded, trace, &outcome, &b).await,
+            Filter::CountAll => drive(guarded.when(|_: &TErr| true), trace, &outcome, &b).await,
+            Filter::CountNone => drive(guarded.when(|_: &TErr| false), trace, &outcome, &b).await,
+            Filter::SkipIgnored => {
+                drive(guarded.when(|e: &TErr| *e != IGNORED), trace, &outcome, &b).await
+            }
         }
-        out
     })
     .0
 }
 
+async fn drive<O: Op<Ok = i32, Err = TErr>, S>(
+    mut op: O,
+    trace: &[Call],
+    outcome: &Cell<Out>,
+    b: &CircuitBreaker<S>,
+) -> Observed {
+    let mut out = Vec::new();
+    for call in trace {
+        sleep(ms(call.gap_ms)).await;
+        outcome.set(call.outcome());
+        let r = op.run().await;
+        out.push((r, b.state()));
+    }
+    out
+}
+
 /// The breaker as a pure state machine over virtual milliseconds. Cool-downs come from a list;
-/// past its end the schedule has stopped.
-fn model(threshold: u32, delays: &[u64], trace: &[Call]) -> Observed {
+/// past its end the schedule has stopped. With `ignoring`, `IGNORED` errors leave the state as
+/// it was (a probe that ends with one gives its slot back); without it they count like any
+/// other error.
+fn model(threshold: u32, delays: &[u64], trace: &[Call], ignoring: bool) -> Observed {
     #[derive(Clone, Copy)]
     enum M {
         Closed(u32),
@@ -83,28 +139,27 @@ fn model(threshold: u32, delays: &[u64], trace: &[Call]) -> Observed {
         };
         let result = match state {
             M::Open(_) => Err(TErr::Open),
+            _ if ignoring && call.kind == Kind::Ignored => Err(IGNORED),
             M::Closed(failures) => {
-                if call.ok {
+                if call.kind == Kind::Ok {
                     state = M::Closed(0);
-                    Ok(1)
                 } else {
                     state = if failures + 1 >= threshold {
                         trip(now)
                     } else {
                         M::Closed(failures + 1)
                     };
-                    Err(TErr::Code(1))
                 }
+                call.outcome()
             }
             M::HalfOpen => {
-                if call.ok {
+                if call.kind == Kind::Ok {
                     state = M::Closed(0);
                     trips = 0;
-                    Ok(1)
                 } else {
                     state = trip(now);
-                    Err(TErr::Code(1))
                 }
+                call.outcome()
             }
         };
         out.push((result, view(state, now)));
@@ -126,14 +181,14 @@ proptest! {
         trace in calls(),
     ) {
         let b = CircuitBreaker::with_schedule(threshold, from_list(delays.clone()));
-        prop_assert_eq!(replay(b, &trace), model(threshold, &delays, &trace));
+        prop_assert_eq!(replay(b, &trace, Filter::None), model(threshold, &delays, &trace, false));
     }
 
     #[test]
     fn a_spaced_schedule_is_the_fixed_cooldown(threshold in 1u32..4, cooldown in 0u64..150, trace in calls()) {
         prop_assert_eq!(
-            replay(CircuitBreaker::with_schedule(threshold, schedule::spaced(ms(cooldown))), &trace),
-            replay(CircuitBreaker::new(threshold, ms(cooldown)), &trace),
+            replay(CircuitBreaker::with_schedule(threshold, schedule::spaced(ms(cooldown))), &trace, Filter::None),
+            replay(CircuitBreaker::new(threshold, ms(cooldown)), &trace, Filter::None),
         );
     }
 
@@ -167,5 +222,61 @@ proptest! {
             (b.state(), op.run().await)
         });
         prop_assert_eq!(r, (BreakerState::Open, Err(TErr::Open)));
+    }
+
+    // ----- error classification ---------------------------------------------------------
+
+    #[test]
+    fn a_classifying_breaker_matches_its_model(
+        threshold in 1u32..4,
+        delays in prop::collection::vec(0u64..150, 0..6),
+        trace in calls(),
+    ) {
+        let b = CircuitBreaker::with_schedule(threshold, from_list(delays.clone()));
+        prop_assert_eq!(replay(b, &trace, Filter::SkipIgnored), model(threshold, &delays, &trace, true));
+    }
+
+    #[test]
+    fn counting_every_error_is_no_classification(threshold in 1u32..4, cooldown in 0u64..150, trace in calls()) {
+        prop_assert_eq!(
+            replay(CircuitBreaker::new(threshold, ms(cooldown)), &trace, Filter::CountAll),
+            replay(CircuitBreaker::new(threshold, ms(cooldown)), &trace, Filter::None),
+        );
+    }
+
+    #[test]
+    fn counting_no_error_never_opens(threshold in 1u32..4, cooldown in 0u64..150, trace in calls()) {
+        let expected: Observed = trace.iter().map(|c| (c.outcome(), BreakerState::Closed)).collect();
+        prop_assert_eq!(replay(CircuitBreaker::new(threshold, ms(cooldown)), &trace, Filter::CountNone), expected);
+    }
+
+    #[test]
+    fn ignored_errors_are_invisible_to_the_breaker(
+        threshold in 1u32..4,
+        delays in prop::collection::vec(0u64..150, 0..6),
+        trace in calls(),
+    ) {
+        // Dropping the ignored calls from the trace (keeping the time they took) leaves the
+        // outcome of every other call, and the state after it, unchanged.
+        let b = CircuitBreaker::with_schedule(threshold, from_list(delays.clone()));
+        let full = replay(b, &trace, Filter::SkipIgnored);
+        let mut kept = Vec::new();
+        let mut gap = 0;
+        for c in &trace {
+            gap += c.gap_ms;
+            if c.kind != Kind::Ignored {
+                kept.push(Call { gap_ms: gap, kind: c.kind });
+                gap = 0;
+            }
+        }
+        let b = CircuitBreaker::with_schedule(threshold, from_list(delays.clone()));
+        let without = replay(b, &kept, Filter::SkipIgnored);
+        let full_kept: Vec<_> = full
+            .into_iter()
+            .zip(&trace)
+            .filter(|(_, c)| c.kind != Kind::Ignored)
+            .map(|(o, _)| o)
+            .collect();
+        prop_assert_eq!(full_kept, without);
     }
 }

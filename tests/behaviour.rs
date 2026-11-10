@@ -13,6 +13,15 @@ use common::*;
 use counterpoint::prelude::*;
 use tokio::time::{Instant, sleep};
 
+/// Counts how many times it is dropped.
+struct CountDrop(Rc<Cell<u32>>);
+
+impl Drop for CountDrop {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
 /// An op that sleeps `d` and returns `v`, flagging `dropped` if cancelled before finishing.
 fn cancellable(d: u64, v: Out, dropped: Rc<Cell<bool>>) -> impl Op<Ok = i32, Err = TErr> {
     from_fn(move || {
@@ -334,12 +343,6 @@ async fn hedge_cancels_the_losers_and_launches_no_more() {
             let n = l.get();
             l.set(n + 1);
             let delay = if n == 0 { 1000 } else { 25 };
-            struct CountDrop(Rc<Cell<u32>>);
-            impl Drop for CountDrop {
-                fn drop(&mut self) {
-                    self.0.set(self.0.get() + 1);
-                }
-            }
             let guard = CountDrop(d);
             sleep(ms(delay)).await;
             std::mem::forget(guard);
@@ -355,6 +358,74 @@ async fn hedge_cancels_the_losers_and_launches_no_more() {
     assert_eq!(dropped.get(), 3);
     sleep(ms(1000)).await;
     assert_eq!(launched.get(), 4, "no hedge starts after the winner");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_final_error_in_a_hedge_cancels_the_rest() {
+    let dropped = Rc::new(Cell::new(0u32));
+    let launched = Rc::new(Cell::new(0u32));
+    let (d, l) = (dropped.clone(), launched.clone());
+    let mut op = from_fn(move || {
+        let (d, l) = (d.clone(), l.clone());
+        async move {
+            let n = l.get();
+            l.set(n + 1);
+            // The primary is slow; the first hedge is rejected for good; the rest are slow.
+            let (delay, out) = if n == 1 {
+                (15, Err(TErr::Code(9)))
+            } else {
+                (1000, Ok(n as i32))
+            };
+            let guard = CountDrop(d);
+            sleep(ms(delay)).await;
+            std::mem::forget(guard);
+            out
+        }
+    })
+    .hedge(schedule::spaced(ms(10)).take(5))
+    .when(|e: &TErr| *e != TErr::Code(9));
+    let t0 = Instant::now();
+    // Launches at 0, 10 and 20; the hedge from t=10 fails for good at 25.
+    assert_eq!(op.run().await, Err(TErr::Code(9)));
+    assert_eq!(t0.elapsed(), ms(25));
+    assert_eq!(launched.get(), 3);
+    assert_eq!(
+        dropped.get(),
+        2,
+        "the primary and the third copy are cancelled"
+    );
+    sleep(ms(1000)).await;
+    assert_eq!(launched.get(), 3, "no hedge starts after a final error");
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncounted_errors_neither_trip_nor_reset_the_breaker() {
+    let b = CircuitBreaker::new(2, ms(100));
+    let outcome = Rc::new(Cell::new(Err(TErr::Code(1))));
+    let o = outcome.clone();
+    let mut op = from_fn(move || {
+        let o = o.clone();
+        async move { o.get() }
+    })
+    .with_breaker(b.clone())
+    .when(|e: &TErr| *e == TErr::Code(1));
+    assert_eq!(op.run().await, Err(TErr::Code(1))); // 1 failure
+    outcome.set(Err(TErr::Code(2)));
+    for _ in 0..5 {
+        assert_eq!(op.run().await, Err(TErr::Code(2))); // neutral
+    }
+    assert_eq!(b.state(), BreakerState::Closed);
+    outcome.set(Err(TErr::Code(1)));
+    assert_eq!(op.run().await, Err(TErr::Code(1))); // 2 failures: opens
+    assert_eq!(b.state(), BreakerState::Open);
+    sleep(ms(100)).await;
+    // A probe that ends with an uncounted error gives the slot back: still half-open.
+    outcome.set(Err(TErr::Code(2)));
+    assert_eq!(op.run().await, Err(TErr::Code(2)));
+    assert_eq!(b.state(), BreakerState::HalfOpen);
+    outcome.set(Ok(7));
+    assert_eq!(op.run().await, Ok(7));
+    assert_eq!(b.state(), BreakerState::Closed);
 }
 
 #[tokio::test(start_paused = true)]
@@ -446,7 +517,9 @@ async fn the_new_combinators_can_be_spawned() {
         let mut op = zip3(leaf.clone(), leaf.clone(), leaf)
             .map(|(a, b, c)| a + b + c)
             .hedge(schedule::spaced(ms(50)).take(1))
+            .when(|e: &TErr| *e != TErr::Timeout)
             .with_breaker(breaker)
+            .when(|e: &TErr| *e != TErr::Code(4))
             .repeat(schedule::recur_until(|v: &i32| *v == 3))
             .retry(schedule::recurs(1) & schedule::recur_while(|e: &TErr| *e != TErr::Open));
         op.run().await

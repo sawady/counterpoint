@@ -113,12 +113,12 @@ Build ops with `from_fn(|| async { .. })` (any async closure), `succeed(v)`, `fa
 | `timeout` | `timeout(∞) ≡ id` · `timeout(t) ≡ id` when the op is faster · `timeout(a).timeout(b) ≡ timeout(min(a, b))` except on ties |
 | `retry` | `retry(stop()) ≡ retry(recurs(0)) ≡ id` · `succeed(a).retry(s) ≡ succeed(a)` · `retry(recurs(n))` runs at most `n + 1` times · nested retries multiply |
 | `repeat` | `repeat(stop()) ≡ id` · `fail(e).repeat(s) ≡ fail(e)` · `repeat` is `retry` with success and failure swapped · nested repeats multiply |
-| `hedge` | `hedge(stop()) ≡ id` · `succeed(a).hedge(s) ≡ succeed(a)` · a success is never slower than the primary's · with succeeding attempts, one hedge after `d` is a `race` against the second attempt delayed by `d`, except on ties · matches an independent model |
+| `hedge` | `hedge(stop()) ≡ id` · `succeed(a).hedge(s) ≡ succeed(a)` · a success is never slower than the primary's · with succeeding attempts, one hedge after `d` is a `race` against the second attempt delayed by `d`, except on ties · matches an independent model · `.when(|_| true) ≡` no filter · with `.when(|_| false)` the first attempt to finish wins (the same `race`, whatever the outcomes) · with any `.when(p)` it matches the model in which errors failing `p` are final |
 | `zip3`…`zip8` | `zipN` is `zip(N-1)` zipped with one more op and flattened, ties included · duration is the max · fails fast |
 | `all` | equals its model (all values in order, or the earliest error) · with `limit(k)` the makespan is greedy list scheduling on `k` slots · `limit(k)` with `k ≥ n` is `all` · both hold on either side of the switch from a pinned slice to `FuturesUnordered` |
 | schedules | `\|`, `&`: associative, commutative, idempotent, absorptive, distributive · `stop()` / `forever()` are the bounds · `then`: associative with unit `stop()` · `cap(a).cap(b) ≡ cap(min(a, b))` · `jitter(0) ≡ id` · all of them also hold for traces of inputs |
 | schedules with input | `contramap(id) ≡ id` · `contramap` composes and distributes over `\|`, `&`, `then` · `recur_while(true) ≡ forever()` · `recur_while(false) ≡ stop()` · `recur_until(p) ≡ recur_while(¬p)` · `m.retry(s & recur_while(p)) ≡ m.retry(s).when(p)` |
-| circuit breaker | `with_schedule(n, spaced(d)) ≡ new(n, d)` · the `k`-th consecutive opening lasts the `k`-th delay of the schedule · a stopped schedule stays open · matches an independent model |
+| circuit breaker | `with_schedule(n, spaced(d)) ≡ new(n, d)` · the `k`-th consecutive opening lasts the `k`-th delay of the schedule · a stopped schedule stays open · matches an independent model · `.when(|_| true) ≡` no filter · with `.when(|_| false)` it never opens · calls whose error `.when` does not count can be removed from a trace without changing anything else |
 
 ## Beyond retries
 
@@ -138,14 +138,20 @@ let mut call = from_fn(|| fetch()).retry(policy);
 let mut job = from_fn(|| status(id))
     .repeat(schedule::spaced(ms(500)) & schedule::recur_until(|s: &Status| s.is_done()));
 
-// Tail latency: start a second copy if the first has not answered in 50ms.
-let mut read = from_fn(|| replica_read()).hedge(schedule::spaced(ms(50)).take(1));
+// Tail latency: start a second copy if the first has not answered in 50ms. A rejected request
+// is final: another copy would only be rejected again.
+let mut read = from_fn(|| replica_read())
+    .hedge(schedule::spaced(ms(50)).take(1))
+    .when(|e: &Error| !matches!(e, Error::BadRequest));
 
 // Flat products of up to 8 ops of different types.
 let (user, cart, flags) = zip3(load_user, load_cart, load_flags).run().await?;
 
 // A breaker that stays open longer while the dependency stays down.
 let breaker = CircuitBreaker::with_schedule(5, schedule::exponential(ms(100)).cap(ms(30_000)));
+// A rejected request says nothing about the health of the dependency: it does not count.
+let mut pay = from_fn(|| charge()).with_breaker(breaker.clone())
+    .when(|e: &Error| !matches!(e, Error::BadRequest));
 ```
 
 ## Performance

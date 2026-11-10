@@ -7,6 +7,17 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- `Hedge::when(pred)`: errors for which `pred` is false are final, like a success: the hedge
+  returns them at once and cancels the other attempts. Without it every error is hedged past,
+  as before.
+- `Breaker::when(pred)` and the `breaker::CountIf` trait: errors for which `pred` is false do
+  not count for the breaker. They neither add to nor reset the consecutive failures, and a
+  half-open probe that ends with one gives its slot back. Without it every error counts, as
+  before.
+- Property tests for both, against extended models of hedging and of the breaker.
+
 ### Changed
 
 - `all` (and `limit` and `settled`) with up to 16 ops in flight no longer goes through

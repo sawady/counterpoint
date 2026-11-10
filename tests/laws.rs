@@ -532,15 +532,8 @@ proptest! {
         let policy = schedule::from_fn(move |s: schedule::Step| ds.get(s.attempt as usize).map(|d| ms(*d)));
         let (op, calls) = scripted(script.clone());
         let (r, t) = observe(op.hedge(policy.take(attempts as u32 - 1)));
-        let model = hedge_model(&script[..attempts], &delays);
-        prop_assert_eq!(t, ms(model.time));
-        prop_assert_eq!(calls.get(), model.launched);
-        match (r, model.result) {
-            (Ok(v), Some(Ok(w))) => prop_assert_eq!(v, w),
-            (Err(_), None) => {} // several failures tied for last
-            (Err(e), Some(Err(w))) => prop_assert_eq!(e, w),
-            (r, m) => prop_assert!(false, "got {:?}, the model says {:?}", r, m),
-        }
+        let model = hedge_model(&script[..attempts], &delays, |_| true);
+        check_hedge_model(r, t, calls.get(), model)?;
     }
 
     #[test]
@@ -566,22 +559,92 @@ proptest! {
         let (op, _) = scripted(vec![a, b]);
         same(op.hedge(schedule::spaced(ms(d)).take(1)), a.op().race(delayed.op()))?;
     }
+
+    // ----- hedge with error classification -----------------------------------------------
+
+    #[test]
+    fn classified_hedge_matches_its_model(
+        script in prop::collection::vec(leaf(), 1..6),
+        delays in prop::collection::vec(0u64..40, 0..5),
+        mask in any::<u8>(),
+    ) {
+        let attempts = script.len().min(delays.len() + 1);
+        let ds = delays.clone();
+        let policy = schedule::from_fn(move |s: schedule::Step| ds.get(s.attempt as usize).map(|d| ms(*d)));
+        let (op, calls) = scripted(script.clone());
+        let (r, t) = observe(op.hedge(policy.take(attempts as u32 - 1)).when(retryable_unless(mask)));
+        let model = hedge_model(&script[..attempts], &delays, retryable_unless(mask));
+        check_hedge_model(r, t, calls.get(), model)?;
+    }
+
+    #[test]
+    fn hedging_every_error_is_no_classification(
+        script in prop::collection::vec(leaf(), 1..6),
+        d in 0u64..40,
+    ) {
+        let s = schedule::spaced(ms(d)).take(script.len() as u32 - 1);
+        let (lhs, lhs_calls) = scripted(script.clone());
+        let (rhs, rhs_calls) = scripted(script.clone());
+        same(lhs.hedge(s).when(|_: &TErr| true), rhs.hedge(s))?;
+        prop_assert_eq!(lhs_calls.get(), rhs_calls.get());
+    }
+
+    #[test]
+    fn classified_hedge_stop_is_identity(a in leaf(), mask in any::<u8>()) {
+        same(a.op().hedge(schedule::stop()).when(retryable_unless(mask)), a.op())?;
+    }
+
+    #[test]
+    fn hedging_no_error_is_a_delayed_race(a in leaf(), b in leaf(), d in 0u64..40) {
+        // With every error final, the first attempt to finish wins, whatever its outcome.
+        prop_assume!(a.delay_ms != d + b.delay_ms);
+        let delayed = Leaf { delay_ms: d + b.delay_ms, ..b };
+        let (op, _) = scripted(vec![a, b]);
+        same(
+            op.hedge(schedule::spaced(ms(d)).take(1)).when(|_: &TErr| false),
+            a.op().race(delayed.op()),
+        )?;
+    }
+
+    #[test]
+    fn a_final_error_launches_no_more_copies(
+        delay in 0u64..40,
+        gap in 1u64..40,
+        extra in 1u32..4,
+    ) {
+        // The primary fails for good before the first hedge is due: nothing else starts.
+        let primary = Leaf { delay_ms: delay, result: Err(TErr::Code(0)) };
+        let (op, calls) = scripted(vec![primary, Leaf { delay_ms: 0, result: Ok(1) }]);
+        let (r, t) = observe(op.hedge(schedule::spaced(ms(delay + gap)).take(extra)).when(retryable_unless(1)));
+        prop_assert_eq!(r, Err(TErr::Code(0)));
+        prop_assert_eq!(t, ms(delay));
+        prop_assert_eq!(calls.get(), 1);
+    }
+}
+
+#[derive(Debug)]
+enum Expect {
+    Exactly(Out),
+    /// Several failures tied for last: any of them.
+    AnyError,
+    /// A success and a final error, or two different final errors, tied: either.
+    Any,
 }
 
 struct HedgeOutcome {
-    /// `None` when the last failures are tied and the winner is unspecified.
-    result: Option<Out>,
+    result: Expect,
     time: u64,
     launched: usize,
 }
 
 /// An independent model of hedging, as a discrete-event simulation over virtual milliseconds.
-fn hedge_model(script: &[Leaf], delays: &[u64]) -> HedgeOutcome {
+/// Errors for which `retryable` is false are final, like a success.
+fn hedge_model(script: &[Leaf], delays: &[u64], retryable: impl Fn(&TErr) -> bool) -> HedgeOutcome {
     let mut now = 0u64;
     let mut launched = 1usize;
     let mut running = vec![(script[0].delay_ms, script[0].result)];
     let mut timer = delays.first().copied();
-    let mut last = None;
+    let mut last = Expect::AnyError;
     loop {
         let next_finish = running.iter().map(|(t, _)| *t).min();
         let due = timer.filter(|_| launched < script.len());
@@ -609,13 +672,53 @@ fn hedge_model(script: &[Leaf], delays: &[u64]) -> HedgeOutcome {
         now = next_finish.expect("a completion is next");
         let (done, rest): (Vec<_>, Vec<_>) = running.into_iter().partition(|(t, _)| *t == now);
         running = rest;
-        if let Some((_, r)) = done.iter().find(|(_, r)| r.is_ok()) {
+        let fatal: Vec<Out> = done
+            .iter()
+            .map(|(_, r)| *r)
+            .filter(|r| r.is_err_and(|e| !retryable(&e)))
+            .collect();
+        let success = done.iter().find(|(_, r)| r.is_ok()).map(|(_, r)| *r);
+        let result = match (success, fatal.first()) {
+            (Some(ok), None) => Some(Expect::Exactly(ok)),
+            (None, Some(&e)) if fatal.iter().all(|f| *f == e) => Some(Expect::Exactly(e)),
+            (None, None) => None,
+            _ => Some(Expect::Any),
+        };
+        if let Some(result) = result {
             return HedgeOutcome {
-                result: Some(*r),
+                result,
                 time: now,
                 launched,
             };
         }
-        last = (done.len() == 1).then(|| done[0].1);
+        last = if done.len() == 1 {
+            Expect::Exactly(done[0].1)
+        } else {
+            Expect::AnyError
+        };
     }
+}
+
+/// Error codes whose bit is set in `mask` are not worth hedging.
+fn retryable_unless(mask: u8) -> impl Fn(&TErr) -> bool + Copy {
+    move |e: &TErr| match e {
+        TErr::Code(c) => mask & (1 << c) == 0,
+        _ => true,
+    }
+}
+
+fn check_hedge_model(
+    r: Out,
+    t: std::time::Duration,
+    launched: usize,
+    model: HedgeOutcome,
+) -> Result<(), TestCaseError> {
+    prop_assert_eq!(t, ms(model.time));
+    prop_assert_eq!(launched, model.launched);
+    match (r, model.result) {
+        (r, Expect::Exactly(w)) => prop_assert_eq!(r, w),
+        (Err(_), Expect::AnyError) | (_, Expect::Any) => {}
+        (r, m) => prop_assert!(false, "got {:?}, the model says {:?}", r, m),
+    }
+    Ok(())
 }

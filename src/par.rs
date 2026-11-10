@@ -15,6 +15,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::time::Instant;
 
 use crate::op::Op;
+use crate::retry::{Always, RetryIf};
 use crate::schedule::{ScheduleFor, Step};
 
 /// See [`Op::zip`].
@@ -188,11 +189,12 @@ where
 /// See [`Op::hedge`].
 #[derive(Clone)]
 #[must_use = "ops do nothing until `.run().await`"]
-pub struct Hedge<O, S> {
+pub struct Hedge<O, S, W = Always> {
     op: O,
     /// Hedges are cloned from here, since `op` is borrowed by the primary attempt.
     template: O,
     schedule: S,
+    when: W,
 }
 
 impl<O: Clone, S> Hedge<O, S> {
@@ -202,6 +204,40 @@ impl<O: Clone, S> Hedge<O, S> {
             op,
             template,
             schedule,
+            when: Always,
+        }
+    }
+}
+
+impl<O, S, W> Hedge<O, S, W> {
+    /// Only hedge past errors for which `pred` returns `true`. Any other error is final, like a
+    /// success: the hedge returns it at once and cancels the attempts still running. Use it for
+    /// errors that another copy would only repeat, such as a rejected request.
+    ///
+    /// Laws: `.when(|_| true) ≡` no filter; `m.hedge(stop()).when(p) ≡ m`; with
+    /// `.when(|_| false)` the first attempt to *finish* wins, so one hedge after `d` is a `race`
+    /// against the second attempt delayed by `d`, except on ties.
+    ///
+    /// ```
+    /// use counterpoint::prelude::*;
+    /// use std::time::Duration;
+    ///
+    /// #[derive(Debug, Clone, PartialEq)]
+    /// enum Error { Slow, NotFound }
+    ///
+    /// # #[tokio::main(flavor = "current_thread", start_paused = true)] async fn main() {
+    /// let mut read = from_fn(|| async { Err::<String, _>(Error::NotFound) })
+    ///     .hedge(schedule::spaced(Duration::from_millis(50)).take(2))
+    ///     .when(|e: &Error| *e != Error::NotFound);
+    /// assert_eq!(read.run().await, Err(Error::NotFound)); // no copy was started
+    /// # }
+    /// ```
+    pub fn when<P>(self, pred: P) -> Hedge<O, S, P> {
+        Hedge {
+            op: self.op,
+            template: self.template,
+            schedule: self.schedule,
+            when: pred,
         }
     }
 }
@@ -210,10 +246,11 @@ async fn run_owned<O: Op>(mut op: O) -> Result<O::Ok, O::Err> {
     op.run().await
 }
 
-impl<O, S> Op for Hedge<O, S>
+impl<O, S, W> Op for Hedge<O, S, W>
 where
     O: Op + Clone,
     S: ScheduleFor<()>,
+    W: RetryIf<O::Err>,
 {
     type Ok = O::Ok;
     type Err = O::Err;
@@ -228,6 +265,7 @@ where
         };
 
         let template = &mut self.template;
+        let when = &mut self.when;
         let mut primary = pin!(self.op.run());
         let mut primary_running = true;
         // Created on the first hedge, so a primary that beats the timer does not allocate.
@@ -242,6 +280,7 @@ where
                     primary_running = false;
                     match result {
                         Ok(value) => return Poll::Ready(Ok(value)),
+                        Err(error) if !when.retryable(&error) => return Poll::Ready(Err(error)),
                         Err(error) => last_error = Some(error),
                     }
                 }
@@ -250,6 +289,9 @@ where
                     while let Poll::Ready(Some(result)) = set.poll_next_unpin(cx) {
                         match result {
                             Ok(value) => return Poll::Ready(Ok(value)),
+                            Err(error) if !when.retryable(&error) => {
+                                return Poll::Ready(Err(error));
+                            }
                             Err(error) => last_error = Some(error),
                         }
                     }
