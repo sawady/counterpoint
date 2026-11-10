@@ -458,4 +458,114 @@ proptest! {
         let c = runs as u64;
         prop_assert_eq!(t, ms(c * d + (c - 1) * gap));
     }
+
+    // ----- hedge ------------------------------------------------------------------------
+
+    #[test]
+    fn hedge_stop_is_identity(a in leaf()) {
+        same(a.op().hedge(schedule::stop()), a.op())?;
+        same(a.op().hedge(schedule::recurs(0)), a.op())?;
+    }
+
+    #[test]
+    fn hedge_never_reruns_an_immediate_success(x in -50i32..50, d in 1u64..20, n in 0u32..4) {
+        same(succeed::<i32, TErr>(x).hedge(schedule::spaced(ms(d)).take(n)), succeed(x))?;
+    }
+
+    #[test]
+    fn hedge_matches_its_model(
+        script in prop::collection::vec(leaf(), 1..6),
+        delays in prop::collection::vec(0u64..40, 0..5),
+    ) {
+        let attempts = script.len().min(delays.len() + 1);
+        let ds = delays.clone();
+        let policy = schedule::from_fn(move |s: schedule::Step| ds.get(s.attempt as usize).map(|d| ms(*d)));
+        let (op, calls) = scripted(script.clone());
+        let (r, t) = observe(op.hedge(policy.take(attempts as u32 - 1)));
+        let model = hedge_model(&script[..attempts], &delays);
+        prop_assert_eq!(t, ms(model.time));
+        prop_assert_eq!(calls.get(), model.launched);
+        match (r, model.result) {
+            (Ok(v), Some(Ok(w))) => prop_assert_eq!(v, w),
+            (Err(_), None) => {} // several failures tied for last
+            (Err(e), Some(Err(w))) => prop_assert_eq!(e, w),
+            (r, m) => prop_assert!(false, "got {:?}, the model says {:?}", r, m),
+        }
+    }
+
+    #[test]
+    fn hedge_success_is_never_slower_than_the_primary(
+        script in prop::collection::vec(leaf(), 1..6),
+        d in 0u64..40,
+    ) {
+        let primary = script[0];
+        prop_assume!(primary.ok());
+        let (op, _) = scripted(script.clone());
+        let (r, t) = observe(op.hedge(schedule::spaced(ms(d)).take(script.len() as u32 - 1)));
+        prop_assert!(r.is_ok());
+        prop_assert!(t <= ms(primary.delay_ms));
+    }
+
+    #[test]
+    fn hedge_of_successes_is_a_delayed_race(a in leaf(), b in leaf(), d in 0u64..40) {
+        let a = Leaf { result: Ok(1), ..a };
+        let b = Leaf { result: Ok(2), ..b };
+        // On an exact tie the primary is polled first in both, but keep the law tie-free.
+        prop_assume!(a.delay_ms != d + b.delay_ms);
+        let delayed = Leaf { delay_ms: d + b.delay_ms, ..b };
+        let (op, _) = scripted(vec![a, b]);
+        same(op.hedge(schedule::spaced(ms(d)).take(1)), a.op().race(delayed.op()))?;
+    }
+}
+
+struct HedgeOutcome {
+    /// `None` when the last failures are tied and the winner is unspecified.
+    result: Option<Out>,
+    time: u64,
+    launched: usize,
+}
+
+/// An independent model of hedging, as a discrete-event simulation over virtual milliseconds.
+fn hedge_model(script: &[Leaf], delays: &[u64]) -> HedgeOutcome {
+    let mut now = 0u64;
+    let mut launched = 1usize;
+    let mut running = vec![(script[0].delay_ms, script[0].result)];
+    let mut timer = delays.first().copied();
+    let mut last = None;
+    loop {
+        let next_finish = running.iter().map(|(t, _)| *t).min();
+        let due = timer.filter(|_| launched < script.len());
+        let launch_at = match (next_finish, due) {
+            (None, None) => {
+                return HedgeOutcome {
+                    result: last,
+                    time: now,
+                    launched,
+                };
+            }
+            // Nothing is running: the next copy starts at once.
+            (None, Some(_)) => Some(now),
+            // Completions are observed before a timer firing at the same instant.
+            (Some(f), Some(t)) if t < f => Some(t),
+            (Some(_), _) => None,
+        };
+        if let Some(at) = launch_at {
+            now = at;
+            running.push((now + script[launched].delay_ms, script[launched].result));
+            launched += 1;
+            timer = delays.get(launched - 1).map(|d| now + d);
+            continue;
+        }
+        now = next_finish.expect("a completion is next");
+        let (done, rest): (Vec<_>, Vec<_>) = running.into_iter().partition(|(t, _)| *t == now);
+        running = rest;
+        if let Some((_, r)) = done.iter().find(|(_, r)| r.is_ok()) {
+            return HedgeOutcome {
+                result: Some(*r),
+                time: now,
+                launched,
+            };
+        }
+        last = (done.len() == 1).then(|| done[0].1);
+    }
 }

@@ -242,6 +242,77 @@ async fn dropping_a_repeat_mid_delay_stops_it() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn hedge_cancels_the_losers_and_launches_no_more() {
+    let dropped = Rc::new(Cell::new(0u32));
+    let launched = Rc::new(Cell::new(0u32));
+    let (d, l) = (dropped.clone(), launched.clone());
+    let mut op = from_fn(move || {
+        let (d, l) = (d.clone(), l.clone());
+        async move {
+            let n = l.get();
+            l.set(n + 1);
+            let delay = if n == 0 { 1000 } else { 25 };
+            struct CountDrop(Rc<Cell<u32>>);
+            impl Drop for CountDrop {
+                fn drop(&mut self) {
+                    self.0.set(self.0.get() + 1);
+                }
+            }
+            let guard = CountDrop(d);
+            sleep(ms(delay)).await;
+            std::mem::forget(guard);
+            Ok::<_, TErr>(n)
+        }
+    })
+    .hedge(schedule::spaced(ms(10)).take(5));
+    let t0 = Instant::now();
+    // Launches at 0, 10, 20, 30; the hedge from t=10 finishes at 35 and wins.
+    assert_eq!(op.run().await, Ok(1));
+    assert_eq!(t0.elapsed(), ms(35));
+    assert_eq!(launched.get(), 4);
+    assert_eq!(dropped.get(), 3);
+    sleep(ms(1000)).await;
+    assert_eq!(launched.get(), 4, "no hedge starts after the winner");
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_a_hedge_cancels_every_attempt() {
+    let dropped = Rc::new(Cell::new(false));
+    let d = dropped.clone();
+    let mut op = from_fn(move || {
+        let d = d.clone();
+        async move {
+            let guard = DropFlag(d);
+            sleep(ms(1000)).await;
+            std::mem::forget(guard);
+            Ok::<_, TErr>(1)
+        }
+    })
+    .hedge(schedule::spaced(ms(10)).take(2));
+    assert!(tokio::time::timeout(ms(25), op.run()).await.is_err());
+    assert!(dropped.get());
+}
+
+#[tokio::test(start_paused = true)]
+async fn hedge_skips_the_timer_when_nothing_is_running() {
+    let (op, calls) = scripted(vec![
+        Leaf {
+            delay_ms: 1,
+            result: Err(TErr::Code(1)),
+        },
+        Leaf {
+            delay_ms: 1,
+            result: Ok(9),
+        },
+    ]);
+    let mut op = op.hedge(schedule::spaced(ms(1000)).take(1));
+    let t0 = Instant::now();
+    assert_eq!(op.run().await, Ok(9));
+    assert_eq!(t0.elapsed(), ms(2));
+    assert_eq!(calls.get(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn zip3_fails_fast_and_cancels_the_siblings() {
     let (b, c) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
     let mut op = zip3(

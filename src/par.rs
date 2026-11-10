@@ -8,11 +8,14 @@ use core::convert::Infallible;
 use core::future::{Future, poll_fn};
 use core::pin::pin;
 use core::task::{Context, Poll};
+use core::time::Duration;
 
 use futures_util::future::{self, Either};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::time::Instant;
 
 use crate::op::Op;
+use crate::schedule::{ScheduleFor, Step};
 
 /// See [`Op::zip`].
 #[derive(Clone)]
@@ -177,6 +180,112 @@ where
             Either::Left((r, _loser)) => r,
             Either::Right((r, _loser)) => r,
         }
+    }
+}
+
+// ----- hedging --------------------------------------------------------------------------------
+
+/// See [`Op::hedge`].
+#[derive(Clone)]
+#[must_use = "ops do nothing until `.run().await`"]
+pub struct Hedge<O, S> {
+    op: O,
+    /// Hedges are cloned from here, since `op` is borrowed by the primary attempt.
+    template: O,
+    schedule: S,
+}
+
+impl<O: Clone, S> Hedge<O, S> {
+    pub(crate) fn new(op: O, schedule: S) -> Self {
+        let template = op.clone();
+        Hedge {
+            op,
+            template,
+            schedule,
+        }
+    }
+}
+
+async fn run_owned<O: Op>(mut op: O) -> Result<O::Ok, O::Err> {
+    op.run().await
+}
+
+impl<O, S> Op for Hedge<O, S>
+where
+    O: Op + Clone,
+    S: ScheduleFor<()>,
+{
+    type Ok = O::Ok;
+    type Err = O::Err;
+
+    async fn run(&mut self) -> Result<O::Ok, O::Err> {
+        let start = Instant::now();
+        let mut schedule = self.schedule.fresh();
+        let mut next_delay: Option<Duration> = schedule.next(&(), Step::default());
+        let Some(first_delay) = next_delay else {
+            // hedge(stop) ≡ id, without even registering a timer.
+            return self.op.run().await;
+        };
+
+        let template = &mut self.template;
+        let mut primary = pin!(self.op.run());
+        let mut primary_running = true;
+        // Created on the first hedge, so a primary that beats the timer does not allocate.
+        let mut hedges = None;
+        let mut timer = pin!(tokio::time::sleep(first_delay));
+        let mut last_error = None;
+        let mut launched: u32 = 0;
+
+        poll_fn(move |cx: &mut Context<'_>| {
+            loop {
+                if primary_running && let Poll::Ready(result) = primary.as_mut().poll(cx) {
+                    primary_running = false;
+                    match result {
+                        Ok(value) => return Poll::Ready(Ok(value)),
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                if let Some(set) = hedges.as_mut() {
+                    let set: &mut FuturesUnordered<_> = set;
+                    while let Poll::Ready(Some(result)) = set.poll_next_unpin(cx) {
+                        match result {
+                            Ok(value) => return Poll::Ready(Ok(value)),
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                }
+                let running = primary_running
+                    || hedges
+                        .as_ref()
+                        .is_some_and(|set: &FuturesUnordered<_>| !set.is_empty());
+                if next_delay.is_none() {
+                    return if running {
+                        Poll::Pending
+                    } else {
+                        let error = last_error.take().expect("every attempt has failed");
+                        Poll::Ready(Err(error))
+                    };
+                }
+                if running && timer.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+
+                launched = launched.saturating_add(1);
+                crate::obs::event!("counterpoint.hedge: starting hedge {}", launched);
+                hedges
+                    .get_or_insert_with(FuturesUnordered::new)
+                    .push(run_owned(template.clone()));
+                let step = Step {
+                    attempt: launched,
+                    elapsed: start.elapsed(),
+                };
+                next_delay = schedule.next(&(), step);
+                if let Some(delay) = next_delay {
+                    timer.set(tokio::time::sleep(delay));
+                }
+            }
+        })
+        .await
     }
 }
 

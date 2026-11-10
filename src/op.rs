@@ -5,7 +5,7 @@ use core::marker::PhantomData;
 use core::time::Duration;
 
 use crate::breaker::{Breaker, CircuitBreaker, CircuitOpen};
-use crate::par::{Join, Race, Zip};
+use crate::par::{Hedge, Join, Race, Zip};
 use crate::retry::{Repeat, Retry};
 use crate::schedule::ScheduleFor;
 use crate::seq::{AndThen, Ensure, Map, MapErr, Or, OrElse};
@@ -199,6 +199,28 @@ pub trait Op {
         Repeat::new(self, schedule)
     }
 
+    /// Hedged execution: start the op, and start another copy each time `schedule` says so
+    /// while none has succeeded. The first *success* wins and cancels the others. An attempt
+    /// that fails drops out; when none is left running, the next copy starts at once instead
+    /// of waiting for its timer. If every attempt fails, the result is the last error to
+    /// arrive.
+    ///
+    /// The schedule is asked for the delay until the next copy when the run starts and after
+    /// each launch. Hedges run on clones of the op as it was when `hedge` was called, so the
+    /// op must be [`Clone`]. A schedule that never stops launches copies until one succeeds:
+    /// bound it, as in `spaced(d).take(2)`.
+    ///
+    /// Laws: `m.hedge(schedule::stop()) ≡ m`; `succeed(a).hedge(s) ≡ succeed(a)`; a success is
+    /// never slower than the primary's; for attempts that succeed, one hedge after `d` is a
+    /// `race` against the second attempt delayed by `d`.
+    fn hedge<S>(self, schedule: S) -> Hedge<Self, S>
+    where
+        Self: Sized + Clone,
+        S: ScheduleFor<()>,
+    {
+        Hedge::new(self, schedule)
+    }
+
     /// Run through a shared [`CircuitBreaker`]. When the breaker is open the op is not run
     /// and fails with [`CircuitOpen`] (converted into `Self::Err`).
     fn with_breaker(self, breaker: CircuitBreaker) -> Breaker<Self>
@@ -255,6 +277,15 @@ pub struct Succeed<T, E> {
     _err: PhantomData<fn() -> E>,
 }
 
+impl<T: Clone, E> Clone for Succeed<T, E> {
+    fn clone(&self) -> Self {
+        Succeed {
+            value: self.value.clone(),
+            _err: PhantomData,
+        }
+    }
+}
+
 /// The op that succeeds immediately with `value` (the `pure`/`return` of the monad).
 pub fn succeed<T: Clone, E>(value: T) -> Succeed<T, E> {
     Succeed {
@@ -279,6 +310,15 @@ pub struct Fail<T, E> {
     _ok: PhantomData<fn() -> T>,
 }
 
+impl<T, E: Clone> Clone for Fail<T, E> {
+    fn clone(&self) -> Self {
+        Fail {
+            error: self.error.clone(),
+            _ok: PhantomData,
+        }
+    }
+}
+
 /// The op that fails immediately with `error`. Left identity of [`Op::or`].
 pub fn fail<T, E: Clone>(error: E) -> Fail<T, E> {
     Fail {
@@ -300,6 +340,12 @@ impl<T, E: Clone> Op for Fail<T, E> {
 #[must_use = "ops do nothing until `.run().await`"]
 pub struct Never<T, E> {
     _t: PhantomData<fn() -> (T, E)>,
+}
+
+impl<T, E> Clone for Never<T, E> {
+    fn clone(&self) -> Self {
+        Never { _t: PhantomData }
+    }
 }
 
 /// The op that never completes: identity of [`Op::race`].
