@@ -226,6 +226,52 @@ async fn half_open_admits_a_single_probe_and_cancelled_probes_release_it() {
     assert_eq!(breaker_op(&b, outcome.clone(), 0).run().await, Ok(2));
 }
 
+// ----- breaker with a cool-down schedule --------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn breaker_cooldown_follows_the_schedule_and_resets_on_close() {
+    let b = CircuitBreaker::with_schedule(1, schedule::exponential(ms(100)).take(2));
+    let outcome = Rc::new(Cell::new(Err(TErr::Code(1))));
+    let mut op = from_fn({
+        let outcome = outcome.clone();
+        move || {
+            let outcome = outcome.clone();
+            async move { outcome.get() }
+        }
+    })
+    .with_breaker(b.clone());
+
+    // First opening lasts 100ms, the second 200ms.
+    assert_eq!(op.run().await, Err(TErr::Code(1)));
+    assert_eq!(b.state(), BreakerState::Open);
+    sleep(ms(99)).await;
+    assert_eq!(b.state(), BreakerState::Open);
+    sleep(ms(1)).await;
+    assert_eq!(b.state(), BreakerState::HalfOpen);
+    assert_eq!(op.run().await, Err(TErr::Code(1)), "failed probe");
+    sleep(ms(199)).await;
+    assert_eq!(b.state(), BreakerState::Open);
+    sleep(ms(1)).await;
+    assert_eq!(b.state(), BreakerState::HalfOpen);
+
+    // A successful probe closes it and resets the schedule.
+    outcome.set(Ok(1));
+    assert_eq!(op.run().await, Ok(1));
+    assert_eq!(b.state(), BreakerState::Closed);
+    outcome.set(Err(TErr::Code(2)));
+    assert_eq!(op.run().await, Err(TErr::Code(2)));
+    sleep(ms(100)).await;
+    assert_eq!(b.state(), BreakerState::HalfOpen);
+
+    // Third consecutive opening: the schedule has stopped, so it stays open for good.
+    assert_eq!(op.run().await, Err(TErr::Code(2)), "failed probe");
+    sleep(ms(200)).await;
+    assert_eq!(op.run().await, Err(TErr::Code(2)), "failed probe");
+    sleep(ms(10_000_000)).await;
+    assert_eq!(b.state(), BreakerState::Open);
+    assert_eq!(op.run().await, Err(TErr::Open));
+}
+
 // ----- repeat, hedge, flat products --------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -354,4 +400,20 @@ async fn composed_ops_can_be_spawned() {
     });
     assert_eq!(handle.await.unwrap(), Ok(3));
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_new_combinators_can_be_spawned() {
+    let breaker = CircuitBreaker::with_schedule(5, schedule::exponential(ms(1)).full_jitter());
+    let handle = tokio::spawn(async move {
+        let leaf = from_fn(|| async { Ok::<i32, TErr>(1) });
+        let mut op = zip3(leaf.clone(), leaf.clone(), leaf)
+            .map(|(a, b, c)| a + b + c)
+            .hedge(schedule::spaced(ms(50)).take(1))
+            .with_breaker(breaker)
+            .repeat(schedule::recur_until(|v: &i32| *v == 3))
+            .retry(schedule::recurs(1) & schedule::recur_while(|e: &TErr| *e != TErr::Open));
+        op.run().await
+    });
+    assert_eq!(handle.await.unwrap(), Ok(3));
 }

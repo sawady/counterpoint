@@ -223,10 +223,11 @@ pub trait Op {
 
     /// Run through a shared [`CircuitBreaker`]. When the breaker is open the op is not run
     /// and fails with [`CircuitOpen`] (converted into `Self::Err`).
-    fn with_breaker(self, breaker: CircuitBreaker) -> Breaker<Self>
+    fn with_breaker<S>(self, breaker: CircuitBreaker<S>) -> Breaker<Self, S>
     where
         Self: Sized,
         Self::Err: From<CircuitOpen>,
+        S: ScheduleFor<()>,
     {
         Breaker::new(self, breaker)
     }

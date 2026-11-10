@@ -6,6 +6,10 @@
 //!
 //! Cancelling a probe (dropping its future) releases the half-open slot, so a cancelled probe
 //! never wedges the breaker.
+//!
+//! The cool-down is a [`Schedule`](crate::schedule::Schedule): [`CircuitBreaker::new`] uses a
+//! fixed one and [`CircuitBreaker::with_schedule`] accepts any, so a breaker can back off while
+//! a dependency stays down.
 
 use core::fmt;
 use core::time::Duration;
@@ -14,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::time::Instant;
 
 use crate::op::Op;
+use crate::schedule::{self, ScheduleFor, Spaced, Step};
 
 /// Error returned when the breaker rejects a call. Convert it into your error type with
 /// `From`.
@@ -41,59 +46,127 @@ pub enum BreakerState {
 
 #[derive(Debug)]
 enum State {
-    Closed { failures: u32 },
-    Open { until: Instant },
-    HalfOpen { probing: bool },
+    Closed {
+        failures: u32,
+    },
+    /// `until` is `None` when the cool-down schedule stopped: open for good.
+    Open {
+        until: Option<Instant>,
+    },
+    HalfOpen {
+        probing: bool,
+    },
 }
 
 #[derive(Debug)]
-struct Inner {
+struct Inner<S> {
     state: State,
     threshold: u32,
-    cooldown: Duration,
+    cooldown: S,
+    /// Trips since the circuit was last closed.
+    trips: u32,
+    /// When the circuit first opened since it was last closed.
+    first_trip: Option<Instant>,
 }
 
-impl Inner {
+impl<S> Inner<S> {
     fn refresh(&mut self) {
-        if let State::Open { until } = self.state
+        if let State::Open { until: Some(until) } = self.state
             && Instant::now() >= until
         {
             self.state = State::HalfOpen { probing: false };
             crate::obs::event!("counterpoint.breaker: half-open");
         }
     }
+}
 
+impl<S: ScheduleFor<()>> Inner<S> {
     fn open(&mut self) {
-        let until = Instant::now()
-            .checked_add(self.cooldown)
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365 * 30));
+        let now = Instant::now();
+        let first_trip = *self.first_trip.get_or_insert(now);
+        let step = Step {
+            attempt: self.trips,
+            elapsed: now.saturating_duration_since(first_trip),
+        };
+        let cooldown = self.cooldown.next(&(), step);
+        self.trips = self.trips.saturating_add(1);
+        crate::obs::event!("counterpoint.breaker: open for {:?}", cooldown);
+        let until = cooldown.map(|d| {
+            now.checked_add(d)
+                .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
+        });
         self.state = State::Open { until };
-        crate::obs::event!("counterpoint.breaker: open for {:?}", self.cooldown);
+    }
+
+    fn close(&mut self) {
+        self.state = State::Closed { failures: 0 };
+        self.cooldown = self.cooldown.fresh();
+        self.trips = 0;
+        self.first_trip = None;
+        crate::obs::event!("counterpoint.breaker: closed");
     }
 }
 
 /// A shared circuit breaker. Cloning it gives another handle to the same breaker.
-#[derive(Debug, Clone)]
-pub struct CircuitBreaker {
-    inner: Arc<Mutex<Inner>>,
+#[derive(Debug)]
+pub struct CircuitBreaker<S = Spaced> {
+    inner: Arc<Mutex<Inner<S>>>,
+}
+
+impl<S> Clone for CircuitBreaker<S> {
+    fn clone(&self) -> Self {
+        CircuitBreaker {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl CircuitBreaker {
     /// Open after `failure_threshold` consecutive failures; stay open for `cooldown`.
     /// Panics if `failure_threshold == 0`.
     pub fn new(failure_threshold: u32, cooldown: Duration) -> Self {
+        Self::with_schedule(failure_threshold, schedule::spaced(cooldown))
+    }
+}
+
+impl<S: ScheduleFor<()>> CircuitBreaker<S> {
+    /// Open after `failure_threshold` consecutive failures and let `cooldown` decide how long
+    /// each opening lasts. Panics if `failure_threshold == 0`.
+    ///
+    /// The schedule is asked once per trip: `attempt` counts the earlier trips since the circuit
+    /// was last closed and `elapsed` is the time since the first of them. When it stops, the
+    /// circuit stays open for good. A successful probe closes the circuit and resets the
+    /// schedule.
+    ///
+    /// Laws: `with_schedule(n, spaced(d)) ≡ new(n, d)`; the `k`-th consecutive opening lasts the
+    /// `k`-th delay of the schedule.
+    ///
+    /// ```
+    /// use counterpoint::prelude::*;
+    /// use std::time::Duration;
+    ///
+    /// let ms = Duration::from_millis;
+    /// let breaker = CircuitBreaker::with_schedule(5, schedule::exponential(ms(100)).cap(ms(5_000)));
+    /// # let _ = breaker;
+    /// ```
+    pub fn with_schedule(failure_threshold: u32, cooldown: S) -> Self {
         assert!(failure_threshold > 0, "failure threshold must be positive");
         CircuitBreaker {
             inner: Arc::new(Mutex::new(Inner {
                 state: State::Closed { failures: 0 },
                 threshold: failure_threshold,
                 cooldown,
+                trips: 0,
+                first_trip: None,
             })),
         }
     }
+}
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        // No user code runs under the lock, so a poisoned lock still holds a valid state.
+impl<S> CircuitBreaker<S> {
+    fn lock(&self) -> MutexGuard<'_, Inner<S>> {
+        // The only user code that runs under the lock is the cool-down schedule, and the state
+        // is written after it returns, so a poisoned lock still holds a valid state.
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -108,7 +181,7 @@ impl CircuitBreaker {
         }
     }
 
-    fn acquire(&self) -> Result<Permit<'_>, CircuitOpen> {
+    fn acquire(&self) -> Result<Permit<'_, S>, CircuitOpen> {
         let mut inner = self.lock();
         inner.refresh();
         let probe = match &mut inner.state {
@@ -127,13 +200,13 @@ impl CircuitBreaker {
     }
 }
 
-struct Permit<'a> {
-    breaker: &'a CircuitBreaker,
+struct Permit<'a, S> {
+    breaker: &'a CircuitBreaker<S>,
     probe: bool,
     settled: bool,
 }
 
-impl Permit<'_> {
+impl<S: ScheduleFor<()>> Permit<'_, S> {
     fn settle(mut self, success: bool) {
         self.settled = true;
         let mut guard = self.breaker.lock();
@@ -146,10 +219,7 @@ impl Permit<'_> {
                     inner.open();
                 }
             }
-            (State::HalfOpen { .. }, true) if self.probe => {
-                inner.state = State::Closed { failures: 0 };
-                crate::obs::event!("counterpoint.breaker: closed");
-            }
+            (State::HalfOpen { .. }, true) if self.probe => inner.close(),
             (State::HalfOpen { .. }, false) if self.probe => inner.open(),
             // Late results of calls admitted before the breaker opened are ignored.
             _ => {}
@@ -157,7 +227,7 @@ impl Permit<'_> {
     }
 }
 
-impl Drop for Permit<'_> {
+impl<S> Drop for Permit<'_, S> {
     fn drop(&mut self) {
         if !self.settled && self.probe {
             let mut inner = self.breaker.lock();
@@ -169,23 +239,32 @@ impl Drop for Permit<'_> {
 }
 
 /// See [`Op::with_breaker`].
-#[derive(Clone)]
 #[must_use = "ops do nothing until `.run().await`"]
-pub struct Breaker<O> {
+pub struct Breaker<O, S = Spaced> {
     op: O,
-    breaker: CircuitBreaker,
+    breaker: CircuitBreaker<S>,
 }
 
-impl<O> Breaker<O> {
-    pub(crate) fn new(op: O, breaker: CircuitBreaker) -> Self {
+impl<O: Clone, S> Clone for Breaker<O, S> {
+    fn clone(&self) -> Self {
+        Breaker {
+            op: self.op.clone(),
+            breaker: self.breaker.clone(),
+        }
+    }
+}
+
+impl<O, S> Breaker<O, S> {
+    pub(crate) fn new(op: O, breaker: CircuitBreaker<S>) -> Self {
         Breaker { op, breaker }
     }
 }
 
-impl<O> Op for Breaker<O>
+impl<O, S> Op for Breaker<O, S>
 where
     O: Op,
     O::Err: From<CircuitOpen>,
+    S: ScheduleFor<()>,
 {
     type Ok = O::Ok;
     type Err = O::Err;
