@@ -3,23 +3,24 @@
 //!
 //! Two schedules are equivalent when, fed the same trace of steps (consecutive attempts,
 //! non-decreasing elapsed time), they make the same decisions up to and including the first
-//! `None` (after which a retry loop stops asking).
+//! `None` (after which a retry loop stops asking). Traces carry an input at every step, so the
+//! laws also cover the schedules that look at their input.
 
 use std::time::Duration;
 
-use counterpoint::schedule::{self, Schedule, Step};
+use counterpoint::schedule::{self, Schedule, ScheduleFor, Step};
 use proptest::prelude::*;
 
 // ----- a type-erased schedule, so proptest can build arbitrary expressions --------------------
 
 trait Erased {
-    fn next_erased(&mut self, step: Step) -> Option<Duration>;
+    fn next_erased(&mut self, input: &u8, step: Step) -> Option<Duration>;
     fn fresh_erased(&self) -> Box<dyn Erased>;
 }
 
-impl<S: Schedule + 'static> Erased for S {
-    fn next_erased(&mut self, step: Step) -> Option<Duration> {
-        self.next(step)
+impl<S: ScheduleFor<u8> + 'static> Erased for S {
+    fn next_erased(&mut self, input: &u8, step: Step) -> Option<Duration> {
+        self.next(input, step)
     }
     fn fresh_erased(&self) -> Box<dyn Erased> {
         Box::new(self.fresh())
@@ -29,11 +30,14 @@ impl<S: Schedule + 'static> Erased for S {
 struct Dyn(Box<dyn Erased>);
 
 impl Schedule for Dyn {
-    fn next(&mut self, step: Step) -> Option<Duration> {
-        self.0.next_erased(step)
-    }
     fn fresh(&self) -> Self {
         Dyn(self.0.fresh_erased())
+    }
+}
+
+impl ScheduleFor<u8> for Dyn {
+    fn next(&mut self, input: &u8, step: Step) -> Option<Duration> {
+        self.0.next_erased(input, step)
     }
 }
 
@@ -47,6 +51,10 @@ enum Expr {
     Exponential(u64),
     Fibonacci(u64),
     Within(u64),
+    RecurWhile(u8),
+    RecurUntil(u8),
+    FromInput(u64),
+    Contramap(Box<Expr>, u8),
     Union(Box<Expr>, Box<Expr>),
     Intersect(Box<Expr>, Box<Expr>),
     Then(Box<Expr>, Box<Expr>),
@@ -59,7 +67,7 @@ fn ms(n: u64) -> Duration {
 
 impl Expr {
     fn build(&self) -> Dyn {
-        fn d<S: Schedule + 'static>(s: S) -> Dyn {
+        fn d<S: ScheduleFor<u8> + 'static>(s: S) -> Dyn {
             Dyn(Box::new(s))
         }
         match self {
@@ -70,6 +78,24 @@ impl Expr {
             Expr::Exponential(x) => d(schedule::exponential(ms(*x))),
             Expr::Fibonacci(x) => d(schedule::fibonacci(ms(*x))),
             Expr::Within(x) => d(schedule::within(ms(*x))),
+            Expr::RecurWhile(k) => {
+                let k = *k;
+                d(schedule::recur_while(move |x: &u8| *x < k))
+            }
+            Expr::RecurUntil(k) => {
+                let k = *k;
+                d(schedule::recur_until(move |x: &u8| *x >= k))
+            }
+            Expr::FromInput(k) => {
+                let k = *k;
+                d(schedule::from_input(move |x: &u8, _| {
+                    (*x < 200).then(|| ms(k * u64::from(*x)))
+                }))
+            }
+            Expr::Contramap(a, k) => {
+                let k = *k;
+                d(a.build().contramap(move |x: &u8| x.wrapping_add(k)))
+            }
             Expr::Union(a, b) => d(a.build() | b.build()),
             Expr::Intersect(a, b) => d(a.build() & b.build()),
             Expr::Then(a, b) => d(a.build().then(b.build())),
@@ -93,7 +119,21 @@ impl<R: Schedule> std::ops::BitAnd<R> for Dyn {
 }
 
 fn expr() -> impl Strategy<Value = Expr> {
-    let leaf = prop_oneof![
+    grow(prop_oneof![
+        pure_leaf(),
+        any::<u8>().prop_map(Expr::RecurWhile),
+        any::<u8>().prop_map(Expr::RecurUntil),
+        (0u64..20).prop_map(Expr::FromInput),
+    ])
+}
+
+/// Expressions built only from schedules that ignore their input.
+fn pure_expr() -> impl Strategy<Value = Expr> {
+    grow(pure_leaf())
+}
+
+fn pure_leaf() -> BoxedStrategy<Expr> {
+    prop_oneof![
         Just(Expr::Stop),
         Just(Expr::Forever),
         (0u32..6).prop_map(Expr::Recurs),
@@ -101,40 +141,49 @@ fn expr() -> impl Strategy<Value = Expr> {
         (1u64..50).prop_map(Expr::Exponential),
         (1u64..50).prop_map(Expr::Fibonacci),
         (0u64..500).prop_map(Expr::Within),
-    ];
+    ]
+    .boxed()
+}
+
+fn grow(leaf: impl Strategy<Value = Expr> + 'static) -> impl Strategy<Value = Expr> {
     leaf.prop_recursive(4, 24, 2, |inner| {
         prop_oneof![
             (inner.clone(), inner.clone()).prop_map(|(a, b)| Expr::Union(a.into(), b.into())),
             (inner.clone(), inner.clone()).prop_map(|(a, b)| Expr::Intersect(a.into(), b.into())),
             (inner.clone(), inner.clone()).prop_map(|(a, b)| Expr::Then(a.into(), b.into())),
-            (inner, 0u64..300).prop_map(|(a, x)| Expr::Cap(a.into(), x)),
+            (inner.clone(), 0u64..300).prop_map(|(a, x)| Expr::Cap(a.into(), x)),
+            (inner, any::<u8>()).prop_map(|(a, k)| Expr::Contramap(a.into(), k)),
         ]
     })
 }
 
-/// A trace of steps: consecutive attempts with non-decreasing elapsed time.
-fn trace() -> impl Strategy<Value = Vec<Step>> {
-    prop::collection::vec(0u64..80, 1..14).prop_map(|gaps| {
+/// A trace: consecutive attempts with non-decreasing elapsed time, each with an input.
+fn trace() -> impl Strategy<Value = Vec<(u8, Step)>> {
+    prop::collection::vec((any::<u8>(), 0u64..80), 1..14).prop_map(|items| {
         let mut elapsed = Duration::ZERO;
-        gaps.into_iter()
+        items
+            .into_iter()
             .enumerate()
-            .map(|(i, g)| {
+            .map(|(i, (input, g))| {
                 elapsed += ms(g);
-                Step {
-                    attempt: i as u32,
-                    elapsed,
-                }
+                (
+                    input,
+                    Step {
+                        attempt: i as u32,
+                        elapsed,
+                    },
+                )
             })
             .collect()
     })
 }
 
 /// Decisions up to and including the first `None`.
-fn run<S: Schedule>(s: &S, steps: &[Step]) -> Vec<Option<Duration>> {
+fn run<S: ScheduleFor<u8>>(s: &S, steps: &[(u8, Step)]) -> Vec<Option<Duration>> {
     let mut s = s.fresh();
     let mut out = Vec::new();
-    for &step in steps {
-        let d = s.next(step);
+    for (input, step) in steps {
+        let d = s.next(input, *step);
         out.push(d);
         if d.is_none() {
             break;
@@ -212,6 +261,62 @@ proptest! {
     #[test]
     fn recurs_then_adds(m in 0u32..5, n in 0u32..5, t in trace()) {
         equiv!(t, schedule::recurs(m).then(schedule::recurs(n)), schedule::recurs(m + n));
+    }
+
+    // ----- inputs -------------------------------------------------------------------------
+
+    #[test]
+    fn contramap_identity(a in expr(), t in trace()) {
+        equiv!(t, a.build().contramap(|x: &u8| *x), a.build());
+    }
+
+    #[test]
+    fn contramap_composition(a in expr(), j in any::<u8>(), k in any::<u8>(), t in trace()) {
+        let f = move |x: &u8| x.wrapping_add(j);
+        let g = move |x: &u8| x.wrapping_mul(k);
+        equiv!(t, a.build().contramap(f).contramap(g), a.build().contramap(move |x: &u8| f(&g(x))));
+    }
+
+    #[test]
+    fn contramap_distributes(a in expr(), b in expr(), k in any::<u8>(), t in trace()) {
+        let f = move |x: &u8| x.wrapping_add(k);
+        equiv!(t, (a.build() | b.build()).contramap(f), a.build().contramap(f) | b.build().contramap(f));
+        equiv!(t, (a.build() & b.build()).contramap(f), a.build().contramap(f) & b.build().contramap(f));
+        equiv!(t, a.build().then(b.build()).contramap(f), a.build().contramap(f).then(b.build().contramap(f)));
+    }
+
+    #[test]
+    fn recur_while_bounds(t in trace()) {
+        equiv!(t, schedule::recur_while(|_: &u8| true), schedule::forever());
+        equiv!(t, schedule::recur_while(|_: &u8| false), schedule::stop());
+    }
+
+    #[test]
+    fn recur_until_is_the_negation_of_recur_while(k in any::<u8>(), t in trace()) {
+        equiv!(t, schedule::recur_until(move |x: &u8| *x >= k), schedule::recur_while(move |x: &u8| *x < k));
+    }
+
+    #[test]
+    fn recur_while_stops_exactly_when_the_predicate_fails(k in any::<u8>(), t in trace()) {
+        let decisions = run(&schedule::recur_while(move |x: &u8| *x < k), &t);
+        let stop = t.iter().position(|(x, _)| *x >= k);
+        prop_assert_eq!(decisions.len(), stop.map_or(t.len(), |i| i + 1));
+        prop_assert_eq!(decisions.last().unwrap().is_none(), stop.is_some());
+    }
+
+    #[test]
+    fn from_input_decides_on_the_input(k in 0u64..20, t in trace()) {
+        let f = move |x: &u8, _: Step| (*x < 200).then(|| ms(k * u64::from(*x)));
+        let decisions = run(&schedule::from_input(f), &t);
+        let expected: Vec<_> = t.iter().map(|(x, s)| f(x, *s)).collect();
+        let n = decisions.len();
+        prop_assert_eq!(decisions, expected[..n].to_vec());
+    }
+
+    #[test]
+    fn schedules_without_input_ignore_it(a in pure_expr(), t in trace(), other in any::<u8>()) {
+        let replaced: Vec<_> = t.iter().map(|(_, s)| (other, *s)).collect();
+        prop_assert_eq!(run(&a.build(), &t), run(&a.build(), &replaced));
     }
 
     // ----- derived operations -----------------------------------------------------------

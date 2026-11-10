@@ -226,6 +226,8 @@ async fn half_open_admits_a_single_probe_and_cancelled_probes_release_it() {
     assert_eq!(breaker_op(&b, outcome.clone(), 0).run().await, Ok(2));
 }
 
+// ----- repeat, hedge, flat products --------------------------------------------------------------
+
 // ----- Send -----------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

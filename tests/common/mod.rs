@@ -131,6 +131,41 @@ pub fn flaky(failures: u32, delay_ms: u64) -> (impl Op<Ok = u32, Err = TErr>, Rc
     (op, calls)
 }
 
+/// An op that plays `script` one run at a time (the last entry repeats). Clones share the
+/// position, so concurrent attempts consume the script in the order they start. Also returns a
+/// counter of how many runs have started.
+pub fn scripted(script: Vec<Leaf>) -> (impl Op<Ok = i32, Err = TErr> + Clone, Rc<Cell<usize>>) {
+    assert!(!script.is_empty());
+    let calls = Rc::new(Cell::new(0usize));
+    let c = calls.clone();
+    let script = Rc::new(script);
+    let op = from_fn(move || {
+        let n = c.get();
+        c.set(n + 1);
+        let leaf = script[n.min(script.len() - 1)];
+        async move {
+            sleep(ms(leaf.delay_ms)).await;
+            leaf.result
+        }
+    });
+    (op, calls)
+}
+
+/// Swaps success and failure.
+pub struct Flip<O>(pub O);
+
+impl<O: Op> Op for Flip<O> {
+    type Ok = O::Err;
+    type Err = O::Ok;
+
+    async fn run(&mut self) -> Result<O::Err, O::Ok> {
+        match self.0.run().await {
+            Ok(v) => Err(v),
+            Err(e) => Ok(e),
+        }
+    }
+}
+
 /// Sets a flag when dropped: proves that a branch was cancelled.
 pub struct DropFlag(pub Rc<Cell<bool>>);
 

@@ -7,7 +7,7 @@ use core::time::Duration;
 use crate::breaker::{Breaker, CircuitBreaker, CircuitOpen};
 use crate::par::{Join, Race, Zip};
 use crate::retry::Retry;
-use crate::schedule::Schedule;
+use crate::schedule::ScheduleFor;
 use crate::seq::{AndThen, Ensure, Map, MapErr, Or, OrElse};
 use crate::time::{Elapsed, Timeout};
 
@@ -171,14 +171,15 @@ pub trait Op {
         Timeout::new(self, limit)
     }
 
-    /// Re-run on failure according to a [`Schedule`].
+    /// Re-run on failure according to a [`Schedule`](crate::schedule::Schedule). The schedule
+    /// sees each error, so it can stop on the ones that are not worth retrying.
     ///
     /// Laws: `m.retry(schedule::stop()) ≡ m` (and so `m.retry(recurs(0)) ≡ m`);
     /// `succeed(a).retry(s) ≡ succeed(a)`.
     fn retry<S>(self, schedule: S) -> Retry<Self, S>
     where
         Self: Sized,
-        S: Schedule,
+        S: ScheduleFor<Self::Err>,
     {
         Retry::new(self, schedule)
     }

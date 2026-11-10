@@ -74,7 +74,7 @@ pub mod time;
 pub use breaker::{BreakerState, CircuitBreaker, CircuitOpen};
 pub use op::{Fail, FromFn, Never, Op, Succeed, fail, from_fn, never, succeed};
 pub use par::{all, race_all};
-pub use schedule::Schedule;
+pub use schedule::{Schedule, ScheduleFor};
 pub use time::Elapsed;
 
 /// Everything needed to write orchestration code: `use counterpoint::prelude::*;`.
@@ -82,6 +82,6 @@ pub mod prelude {
     pub use crate::breaker::{BreakerState, CircuitBreaker, CircuitOpen};
     pub use crate::op::{Op, fail, from_fn, never, succeed};
     pub use crate::par::{all, race_all};
-    pub use crate::schedule::{self, Schedule};
+    pub use crate::schedule::{self, Schedule, ScheduleFor};
     pub use crate::time::Elapsed;
 }

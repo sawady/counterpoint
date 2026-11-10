@@ -15,6 +15,14 @@
 //! for `|` and `&` (all checked by the property tests in `tests/schedule_laws.rs`).
 //! [`Schedule::then`] is a third, sequential composition that forms a monoid with [`stop`].
 //!
+//! ## Schedules with input
+//!
+//! A schedule that implements [`ScheduleFor<In>`] can look at a value of type `In` when it
+//! decides: the error when retrying and the value when repeating. The stock schedules ignore
+//! their input, so they work for every `In`; [`recur_while`], [`recur_until`] and [`from_input`]
+//! inspect it, and [`Schedule::contramap`] adapts a schedule to another input type. Decisions
+//! are still compared pointwise, so all the laws above hold for traces of inputs and steps.
+//!
 //! ```
 //! use counterpoint::schedule::{self, Schedule};
 //! use std::time::Duration;
@@ -24,6 +32,27 @@
 //! let s = schedule::exponential(ms(100)).cap(ms(1000)) & schedule::recurs(5);
 //! let delays: Vec<_> = s.delays().collect();
 //! assert_eq!(delays, [ms(100), ms(200), ms(400), ms(800), ms(1000)]);
+//! ```
+//!
+//! Retrying only transient errors, and honouring a delay the server asked for:
+//!
+//! ```
+//! use counterpoint::schedule::{self, Schedule, ScheduleFor, Step};
+//! use std::time::Duration;
+//!
+//! enum Error { RateLimited(Duration), Unavailable, BadRequest }
+//!
+//! let ms = Duration::from_millis;
+//! let mut policy = schedule::from_input(|e: &Error, _| match e {
+//!     Error::RateLimited(wait) => Some(*wait),
+//!     Error::Unavailable => Some(ms(10)),
+//!     Error::BadRequest => None,
+//! })
+//! .take(3);
+//!
+//! let step = Step::default();
+//! assert_eq!(policy.next(&Error::RateLimited(ms(250)), step), Some(ms(250)));
+//! assert_eq!(policy.next(&Error::BadRequest, step), None);
 //! ```
 
 use core::ops::{BitAnd, BitOr};
@@ -39,11 +68,12 @@ pub struct Step {
     pub elapsed: Duration,
 }
 
-/// A retry policy. See the [module docs](self) for the algebra.
+/// A schedule: a policy that can be reset and composed. See the [module docs](self) for the
+/// algebra.
+///
+/// This trait does not mention the input, so the combinators work on every schedule without
+/// type annotations. The decision itself lives in [`ScheduleFor`].
 pub trait Schedule {
-    /// Decide after a failure: `Some(delay)` to retry after `delay`, `None` to give up.
-    fn next(&mut self, step: Step) -> Option<Duration>;
-
     /// A copy of this schedule in its initial state. Retrying calls this once per run, so a
     /// schedule value can be reused. Unseeded jitter draws a new seed here.
     fn fresh(&self) -> Self
@@ -124,11 +154,22 @@ pub trait Schedule {
         Jitter::new(self, 0.0, 1.0)
     }
 
+    /// Adapt the input: the schedule decides on `f(&input)`.
+    ///
+    /// Laws: `s.contramap(|x| *x) ≡ s`, `s.contramap(f).contramap(g) ≡ s.contramap(f ∘ g)`, and
+    /// `contramap` distributes over `|`, `&` and `then`.
+    fn contramap<F>(self, f: F) -> Contramap<Self, F>
+    where
+        Self: Sized,
+    {
+        Contramap { inner: self, f }
+    }
+
     /// The delays this schedule would produce if every attempt took no time. Handy for docs
     /// and tests; it is infinite for schedules that never stop.
     fn delays(&self) -> Delays<Self>
     where
-        Self: Sized,
+        Self: Sized + ScheduleFor<()>,
     {
         Delays {
             s: self.fresh(),
@@ -136,6 +177,13 @@ pub trait Schedule {
             done: false,
         }
     }
+}
+
+/// A schedule that can decide after seeing a value of type `In`: the error when retrying, the
+/// value when repeating. Schedules that ignore their input implement this for every `In`.
+pub trait ScheduleFor<In: ?Sized>: Schedule {
+    /// `Some(delay)` to go again after `delay`, `None` to stop.
+    fn next(&mut self, input: &In, step: Step) -> Option<Duration>;
 }
 
 /// Iterator returned by [`Schedule::delays`].
@@ -146,14 +194,14 @@ pub struct Delays<S> {
     done: bool,
 }
 
-impl<S: Schedule> Iterator for Delays<S> {
+impl<S: ScheduleFor<()>> Iterator for Delays<S> {
     type Item = Duration;
 
     fn next(&mut self) -> Option<Duration> {
         if self.done {
             return None;
         }
-        match self.s.next(self.step) {
+        match self.s.next(&(), self.step) {
             Some(d) => {
                 self.step.attempt = self.step.attempt.saturating_add(1);
                 self.step.elapsed = self.step.elapsed.saturating_add(d);
@@ -179,11 +227,14 @@ pub fn stop() -> Stop {
 }
 
 impl Schedule for Stop {
-    fn next(&mut self, _: Step) -> Option<Duration> {
-        None
-    }
     fn fresh(&self) -> Self {
         Stop
+    }
+}
+
+impl<In: ?Sized> ScheduleFor<In> for Stop {
+    fn next(&mut self, _: &In, _: Step) -> Option<Duration> {
+        None
     }
 }
 
@@ -197,11 +248,14 @@ pub fn forever() -> Forever {
 }
 
 impl Schedule for Forever {
-    fn next(&mut self, _: Step) -> Option<Duration> {
-        Some(Duration::ZERO)
-    }
     fn fresh(&self) -> Self {
         Forever
+    }
+}
+
+impl<In: ?Sized> ScheduleFor<In> for Forever {
+    fn next(&mut self, _: &In, _: Step) -> Option<Duration> {
+        Some(Duration::ZERO)
     }
 }
 
@@ -216,11 +270,14 @@ pub fn recurs(n: u32) -> Recurs {
 }
 
 impl Schedule for Recurs {
-    fn next(&mut self, step: Step) -> Option<Duration> {
-        (step.attempt < self.0).then_some(Duration::ZERO)
-    }
     fn fresh(&self) -> Self {
         *self
+    }
+}
+
+impl<In: ?Sized> ScheduleFor<In> for Recurs {
+    fn next(&mut self, _: &In, step: Step) -> Option<Duration> {
+        (step.attempt < self.0).then_some(Duration::ZERO)
     }
 }
 
@@ -234,11 +291,14 @@ pub fn spaced(d: Duration) -> Spaced {
 }
 
 impl Schedule for Spaced {
-    fn next(&mut self, _: Step) -> Option<Duration> {
-        Some(self.0)
-    }
     fn fresh(&self) -> Self {
         *self
+    }
+}
+
+impl<In: ?Sized> ScheduleFor<In> for Spaced {
+    fn next(&mut self, _: &In, _: Step) -> Option<Duration> {
+        Some(self.0)
     }
 }
 
@@ -268,13 +328,16 @@ impl Exponential {
 }
 
 impl Schedule for Exponential {
-    fn next(&mut self, step: Step) -> Option<Duration> {
+    fn fresh(&self) -> Self {
+        *self
+    }
+}
+
+impl<In: ?Sized> ScheduleFor<In> for Exponential {
+    fn next(&mut self, _: &In, step: Step) -> Option<Duration> {
         let exp = i32::try_from(step.attempt).unwrap_or(i32::MAX);
         let secs = self.base.as_secs_f64() * self.factor.powi(exp);
         Some(Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX))
-    }
-    fn fresh(&self) -> Self {
-        *self
     }
 }
 
@@ -288,7 +351,13 @@ pub fn fibonacci(base: Duration) -> Fibonacci {
 }
 
 impl Schedule for Fibonacci {
-    fn next(&mut self, step: Step) -> Option<Duration> {
+    fn fresh(&self) -> Self {
+        *self
+    }
+}
+
+impl<In: ?Sized> ScheduleFor<In> for Fibonacci {
+    fn next(&mut self, _: &In, step: Step) -> Option<Duration> {
         let (mut a, mut b) = (1u32, 1u32);
         for _ in 0..step.attempt {
             (a, b) = (b, a.saturating_add(b));
@@ -297,9 +366,6 @@ impl Schedule for Fibonacci {
             }
         }
         Some(self.0.checked_mul(a).unwrap_or(Duration::MAX))
-    }
-    fn fresh(&self) -> Self {
-        *self
     }
 }
 
@@ -314,11 +380,14 @@ pub fn within(budget: Duration) -> Within {
 }
 
 impl Schedule for Within {
-    fn next(&mut self, step: Step) -> Option<Duration> {
-        (step.elapsed < self.0).then_some(Duration::ZERO)
-    }
     fn fresh(&self) -> Self {
         *self
+    }
+}
+
+impl<In: ?Sized> ScheduleFor<In> for Within {
+    fn next(&mut self, _: &In, step: Step) -> Option<Duration> {
+        (step.elapsed < self.0).then_some(Duration::ZERO)
     }
 }
 
@@ -326,7 +395,8 @@ impl Schedule for Within {
 #[derive(Debug, Clone, Copy)]
 pub struct FromFn<F>(F);
 
-/// A custom schedule from a closure. The closure is cloned on [`Schedule::fresh`].
+/// A custom schedule from a closure of the [`Step`]. The closure is cloned on
+/// [`Schedule::fresh`]. To look at the input as well, use [`from_input`].
 pub fn from_fn<F>(f: F) -> FromFn<F>
 where
     F: FnMut(Step) -> Option<Duration> + Clone,
@@ -338,11 +408,107 @@ impl<F> Schedule for FromFn<F>
 where
     F: FnMut(Step) -> Option<Duration> + Clone,
 {
-    fn next(&mut self, step: Step) -> Option<Duration> {
-        (self.0)(step)
-    }
     fn fresh(&self) -> Self {
         FromFn(self.0.clone())
+    }
+}
+
+impl<In: ?Sized, F> ScheduleFor<In> for FromFn<F>
+where
+    F: FnMut(Step) -> Option<Duration> + Clone,
+{
+    fn next(&mut self, _: &In, step: Step) -> Option<Duration> {
+        (self.0)(step)
+    }
+}
+
+/// A schedule built from a function of the input and the [`Step`]. See [`from_input`].
+#[derive(Debug, Clone, Copy)]
+pub struct FromInput<F>(F);
+
+/// A schedule that decides from the input: retry-after headers, error classification, polling
+/// a value. The closure is cloned on [`Schedule::fresh`].
+pub fn from_input<I, F>(f: F) -> FromInput<F>
+where
+    I: ?Sized,
+    F: FnMut(&I, Step) -> Option<Duration> + Clone,
+{
+    FromInput(f)
+}
+
+impl<F: Clone> Schedule for FromInput<F> {
+    fn fresh(&self) -> Self {
+        FromInput(self.0.clone())
+    }
+}
+
+impl<In: ?Sized, F> ScheduleFor<In> for FromInput<F>
+where
+    F: FnMut(&In, Step) -> Option<Duration> + Clone,
+{
+    fn next(&mut self, input: &In, step: Step) -> Option<Duration> {
+        (self.0)(input, step)
+    }
+}
+
+/// Continue immediately while a predicate on the input holds. See [`recur_while`].
+#[derive(Debug, Clone, Copy)]
+pub struct RecurWhile<P>(P);
+
+/// Continue without waiting while `pred(input)` holds. Meant to be intersected with a delaying
+/// schedule: `exponential(..) & recur_while(|e: &Error| e.is_transient())`.
+///
+/// Laws: `m.retry(s & recur_while(p)) ≡ m.retry(s).when(p)`;
+/// `recur_while(|_| true) ≡ forever()`; `recur_while(|_| false) ≡ stop()`.
+pub fn recur_while<I, P>(pred: P) -> RecurWhile<P>
+where
+    I: ?Sized,
+    P: FnMut(&I) -> bool + Clone,
+{
+    RecurWhile(pred)
+}
+
+impl<P: Clone> Schedule for RecurWhile<P> {
+    fn fresh(&self) -> Self {
+        RecurWhile(self.0.clone())
+    }
+}
+
+impl<In: ?Sized, P> ScheduleFor<In> for RecurWhile<P>
+where
+    P: FnMut(&In) -> bool + Clone,
+{
+    fn next(&mut self, input: &In, _: Step) -> Option<Duration> {
+        (self.0)(input).then_some(Duration::ZERO)
+    }
+}
+
+/// Continue immediately until a predicate on the input holds. See [`recur_until`].
+#[derive(Debug, Clone, Copy)]
+pub struct RecurUntil<P>(P);
+
+/// Continue without waiting until `pred(input)` holds: the negation of [`recur_while`]. Handy for
+/// polling: `op.repeat(spaced(d) & recur_until(|job: &Job| job.is_done()))`.
+pub fn recur_until<I, P>(pred: P) -> RecurUntil<P>
+where
+    I: ?Sized,
+    P: FnMut(&I) -> bool + Clone,
+{
+    RecurUntil(pred)
+}
+
+impl<P: Clone> Schedule for RecurUntil<P> {
+    fn fresh(&self) -> Self {
+        RecurUntil(self.0.clone())
+    }
+}
+
+impl<In: ?Sized, P> ScheduleFor<In> for RecurUntil<P>
+where
+    P: FnMut(&In) -> bool + Clone,
+{
+    fn next(&mut self, input: &In, _: Step) -> Option<Duration> {
+        (!(self.0)(input)).then_some(Duration::ZERO)
     }
 }
 
@@ -356,18 +522,21 @@ pub struct Union<A, B> {
 }
 
 impl<A: Schedule, B: Schedule> Schedule for Union<A, B> {
-    fn next(&mut self, step: Step) -> Option<Duration> {
-        // Both sides always step, so stateful children stay in sync.
-        match (self.a.next(step), self.b.next(step)) {
-            (Some(x), Some(y)) => Some(x.min(y)),
-            (x, None) => x,
-            (None, y) => y,
-        }
-    }
     fn fresh(&self) -> Self {
         Union {
             a: self.a.fresh(),
             b: self.b.fresh(),
+        }
+    }
+}
+
+impl<In: ?Sized, A: ScheduleFor<In>, B: ScheduleFor<In>> ScheduleFor<In> for Union<A, B> {
+    fn next(&mut self, input: &In, step: Step) -> Option<Duration> {
+        // Both sides always step, so stateful children stay in sync.
+        match (self.a.next(input, step), self.b.next(input, step)) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, None) => x,
+            (None, y) => y,
         }
     }
 }
@@ -380,16 +549,19 @@ pub struct Intersect<A, B> {
 }
 
 impl<A: Schedule, B: Schedule> Schedule for Intersect<A, B> {
-    fn next(&mut self, step: Step) -> Option<Duration> {
-        match (self.a.next(step), self.b.next(step)) {
-            (Some(x), Some(y)) => Some(x.max(y)),
-            _ => None,
-        }
-    }
     fn fresh(&self) -> Self {
         Intersect {
             a: self.a.fresh(),
             b: self.b.fresh(),
+        }
+    }
+}
+
+impl<In: ?Sized, A: ScheduleFor<In>, B: ScheduleFor<In>> ScheduleFor<In> for Intersect<A, B> {
+    fn next(&mut self, input: &In, step: Step) -> Option<Duration> {
+        match (self.a.next(input, step), self.b.next(input, step)) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            _ => None,
         }
     }
 }
@@ -403,10 +575,20 @@ pub struct Then<A, B> {
 }
 
 impl<A: Schedule, B: Schedule> Schedule for Then<A, B> {
-    fn next(&mut self, step: Step) -> Option<Duration> {
+    fn fresh(&self) -> Self {
+        Then {
+            a: self.a.fresh(),
+            b: self.b.fresh(),
+            switched_at: None,
+        }
+    }
+}
+
+impl<In: ?Sized, A: ScheduleFor<In>, B: ScheduleFor<In>> ScheduleFor<In> for Then<A, B> {
+    fn next(&mut self, input: &In, step: Step) -> Option<Duration> {
         let offset = match self.switched_at {
             Some(k) => k,
-            None => match self.a.next(step) {
+            None => match self.a.next(input, step) {
                 Some(d) => return Some(d),
                 None => {
                     self.switched_at = Some(step.attempt);
@@ -414,17 +596,13 @@ impl<A: Schedule, B: Schedule> Schedule for Then<A, B> {
                 }
             },
         };
-        self.b.next(Step {
-            attempt: step.attempt - offset,
-            elapsed: step.elapsed,
-        })
-    }
-    fn fresh(&self) -> Self {
-        Then {
-            a: self.a.fresh(),
-            b: self.b.fresh(),
-            switched_at: None,
-        }
+        self.b.next(
+            input,
+            Step {
+                attempt: step.attempt - offset,
+                elapsed: step.elapsed,
+            },
+        )
     }
 }
 
@@ -436,14 +614,17 @@ pub struct Cap<S> {
 }
 
 impl<S: Schedule> Schedule for Cap<S> {
-    fn next(&mut self, step: Step) -> Option<Duration> {
-        self.inner.next(step).map(|d| d.min(self.max))
-    }
     fn fresh(&self) -> Self {
         Cap {
             inner: self.inner.fresh(),
             max: self.max,
         }
+    }
+}
+
+impl<In: ?Sized, S: ScheduleFor<In>> ScheduleFor<In> for Cap<S> {
+    fn next(&mut self, input: &In, step: Step) -> Option<Duration> {
+        self.inner.next(input, step).map(|d| d.min(self.max))
     }
 }
 
@@ -477,12 +658,6 @@ impl<S> Jitter<S> {
 }
 
 impl<S: Schedule> Schedule for Jitter<S> {
-    fn next(&mut self, step: Step) -> Option<Duration> {
-        let d = self.inner.next(step)?;
-        let r = self.rng.next_f64();
-        let factor = self.lo + (self.hi - self.lo) * r;
-        Some(Duration::try_from_secs_f64(d.as_secs_f64() * factor).unwrap_or(Duration::MAX))
-    }
     fn fresh(&self) -> Self {
         Jitter {
             inner: self.inner.fresh(),
@@ -491,6 +666,42 @@ impl<S: Schedule> Schedule for Jitter<S> {
             seed: self.seed,
             rng: self.seed.map_or_else(SplitMix64::random, SplitMix64),
         }
+    }
+}
+
+impl<In: ?Sized, S: ScheduleFor<In>> ScheduleFor<In> for Jitter<S> {
+    fn next(&mut self, input: &In, step: Step) -> Option<Duration> {
+        let d = self.inner.next(input, step)?;
+        let r = self.rng.next_f64();
+        let factor = self.lo + (self.hi - self.lo) * r;
+        Some(Duration::try_from_secs_f64(d.as_secs_f64() * factor).unwrap_or(Duration::MAX))
+    }
+}
+
+/// See [`Schedule::contramap`].
+#[derive(Debug, Clone, Copy)]
+pub struct Contramap<S, F> {
+    inner: S,
+    f: F,
+}
+
+impl<S: Schedule, F: Clone> Schedule for Contramap<S, F> {
+    fn fresh(&self) -> Self {
+        Contramap {
+            inner: self.inner.fresh(),
+            f: self.f.clone(),
+        }
+    }
+}
+
+impl<In: ?Sized, Out, S, F> ScheduleFor<In> for Contramap<S, F>
+where
+    S: ScheduleFor<Out>,
+    F: FnMut(&In) -> Out + Clone,
+{
+    fn next(&mut self, input: &In, step: Step) -> Option<Duration> {
+        let mapped = (self.f)(input);
+        self.inner.next(&mapped, step)
     }
 }
 
@@ -547,9 +758,13 @@ impl_ops!(
     [] Fibonacci,
     [] Within,
     [F] FromFn<F>,
+    [F] FromInput<F>,
+    [P] RecurWhile<P>,
+    [P] RecurUntil<P>,
     [A, B] Union<A, B>,
     [A, B] Intersect<A, B>,
     [A, B] Then<A, B>,
     [S] Cap<S>,
     [S] Jitter<S>,
+    [S, F] Contramap<S, F>,
 );

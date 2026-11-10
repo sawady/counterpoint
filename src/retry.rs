@@ -1,11 +1,11 @@
-//! Retrying an [`Op`] according to a [`Schedule`].
+//! Retrying an [`Op`] according to a [`Schedule`](crate::schedule::Schedule).
 
 use core::time::Duration;
 
 use tokio::time::Instant;
 
 use crate::op::Op;
-use crate::schedule::{Schedule, Step};
+use crate::schedule::{ScheduleFor, Step};
 
 /// Decides whether an error is worth retrying. Implemented by [`Always`] and by any
 /// `FnMut(&E) -> bool`.
@@ -99,7 +99,7 @@ impl<O, S, W, H> Retry<O, S, W, H> {
 impl<O, S, W, H> Op for Retry<O, S, W, H>
 where
     O: Op,
-    S: Schedule,
+    S: ScheduleFor<O::Err>,
     W: RetryIf<O::Err>,
     H: OnRetry<O::Err>,
 {
@@ -122,7 +122,7 @@ where
                 attempt,
                 elapsed: start.elapsed(),
             };
-            let Some(delay) = schedule.next(step) else {
+            let Some(delay) = schedule.next(&err, step) else {
                 crate::obs::event!("counterpoint.retry: giving up after {} retries", attempt);
                 return Err(err);
             };

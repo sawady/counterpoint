@@ -276,4 +276,34 @@ proptest! {
         let _ = observe(op.retry(schedule::recurs(m)).retry(schedule::recurs(n)));
         prop_assert_eq!(calls.get(), (m + 1) * (n + 1));
     }
+
+    // ----- retry with input --------------------------------------------------------------
+
+    #[test]
+    fn retry_with_recur_while_is_when(script in prop::collection::vec(leaf(), 1..6), n in 0u32..6, gap in 0u64..20, limit in 0u8..5) {
+        let p = move |e: &TErr| matches!(e, TErr::Code(c) if *c < limit);
+        let s = schedule::spaced(ms(gap)) & schedule::recurs(n);
+        let (lhs, lhs_calls) = scripted(script.clone());
+        let (rhs, rhs_calls) = scripted(script);
+        let left = observe(lhs.retry(s & schedule::recur_while(p)));
+        let right = observe(rhs.retry(s).when(p));
+        prop_assert_eq!(left, right);
+        prop_assert_eq!(lhs_calls.get(), rhs_calls.get());
+    }
+
+    #[test]
+    fn retry_waits_what_the_error_says(codes in prop::collection::vec(0u8..5, 1..6), d in 0u64..20, factor in 0u64..15) {
+        let script: Vec<_> = codes.iter().map(|c| Leaf { delay_ms: d, result: Err(TErr::Code(*c)) }).collect();
+        let n = codes.len();
+        let (op, calls) = scripted(script);
+        let wait = move |e: &TErr, _: schedule::Step| match e {
+            TErr::Code(c) => Some(ms(factor * u64::from(*c))),
+            _ => None,
+        };
+        let (r, t) = observe(op.retry(schedule::from_input(wait).take(n as u32 - 1)));
+        prop_assert_eq!(r, Err(TErr::Code(codes[n - 1])));
+        prop_assert_eq!(calls.get(), n);
+        let waits: u64 = codes[..n - 1].iter().map(|c| factor * u64::from(*c)).sum();
+        prop_assert_eq!(t, ms(n as u64 * d + waits));
+    }
 }
