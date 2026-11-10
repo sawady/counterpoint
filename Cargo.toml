@@ -22,8 +22,23 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"], op
 tracing = ["dep:tracing"]
 
 [dev-dependencies]
+backon = "1.6.0"
+criterion = "0.8.2"
+futures = "0.3.34"
 proptest = "1.12.0"
 tokio = { version = "1.54.1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+
+[[bench]]
+name = "overhead"
+harness = false
+
+[[bench]]
+name = "retry_timers"
+harness = false
+
+[[bench]]
+name = "footprint"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

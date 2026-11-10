@@ -71,9 +71,11 @@ them:
 - **Retry schedules as an algebra**, in the spirit of ZIO's `Schedule`: `|` and `&` are the
   pointwise `min`/`max` of delays, so schedules form a distributive lattice with `stop()` and
   `forever()` as bounds, and `then` sequences them as a monoid.
-- **Zero-cost and cancel-safe.** Ops are plain generic structs: no `Box<dyn>`, no spawning, no
-  `'static` bound. Dropping a running op cancels everything inside it (losing race branches,
-  sibling branches after a failure, in-flight attempts, backoff sleeps, breaker probes).
+- **Cancel-safe, with the overhead measured.** Ops are plain generic structs: no `Box<dyn>`, no
+  spawning, no `'static` bound. Dropping a running op cancels everything inside it (losing race
+  branches, sibling branches after a failure, in-flight attempts, backoff sleeps, breaker
+  probes). The fixed combinators cost about the same as writing the code by hand; `all` and
+  retries are measurably not free. See [Performance](#performance).
 - **Typed errors.** Timeouts and an open breaker surface as `Elapsed` / `CircuitOpen`, which
   you convert into your own error type with `From`.
 
@@ -112,6 +114,56 @@ Build ops with `from_fn(|| async { .. })` (any async closure), `succeed(v)`, `fa
 | `retry` | `retry(stop()) ≡ retry(recurs(0)) ≡ id` · `succeed(a).retry(s) ≡ succeed(a)` · `retry(recurs(n))` runs at most `n + 1` times · nested retries multiply |
 | `all` | equals its model (all values in order, or the earliest error) · with `limit(k)` the makespan is greedy list scheduling on `k` slots |
 | schedules | `\|`, `&`: associative, commutative, idempotent, absorptive, distributive · `stop()` / `forever()` are the bounds · `then`: associative with unit `stop()` · `cap(a).cap(b) ≡ cap(min(a, b))` · `jitter(0) ≡ id` |
+
+## Performance
+
+Benchmarks against the same orchestration written directly with `futures`, `tokio` and `backon`
+live in [`benches/`](benches) (`cargo bench`). The leaves do no work, so this is the worst case
+for any orchestration layer. Times are the median of two runs (criterion, rustc 1.94.1, 8-core
+x86-64 under WSL2) and include about 130 ns of `Runtime::block_on`; differences of a few ns are
+within the noise between runs.
+
+| Scenario | Direct | `counterpoint` |
+|---|---|---|
+| leaf (`from_fn`) | 131 ns | 130 ns |
+| `map` + `and_then` chain vs `async fn` | 132 ns | 129 ns |
+| `zip`, ready leaves vs `try_join` | 138 ns | 140 ns |
+| `zip`, yielding leaves vs `try_join` | 302 ns | 305 ns |
+| `race` vs `select` | 286 ns | 290 ns |
+| `timeout` vs `tokio::time::timeout` | 171 ns | 174 ns |
+| `retry(timeout(zip))`, happy path, vs `backon` + `tokio` + `futures` | 199 ns | 200 ns |
+| `retry`, no failure, vs `backon` | 146 ns | 155 ns |
+| `retry`, 3 failures without delay, vs `backon` with a no-op sleeper | 145 ns | 213 ns |
+| `retry`, 3 failures, 1 ms delays, paused clock, vs `backon` | 1.29 µs | 1.37 µs |
+| `all` of 16 vs `try_join_all` | 172 ns | 1.51 µs |
+| `all` of 16 with `limit(4)` vs `buffered(4)` | 1.48 µs | 1.36 µs |
+
+Future size and heap allocations per run (`cargo bench --bench footprint`), which do not depend
+on the machine:
+
+| Scenario | Direct | `counterpoint` |
+|---|---|---|
+| `zip` of two yielding leaves vs `try_join` | 96 bytes | 112 bytes |
+| `race` of two yielding leaves vs `select` | 104 bytes | 112 bytes |
+| `timeout` vs `tokio::time::timeout` | 136 bytes | 152 bytes |
+| `retry` vs `backon` | 192 bytes | 176 bytes |
+| allocations, `zip` / `race` / `timeout` / `retry` | same as direct | same as direct |
+| allocations, `all` of 16 vs `try_join_all` | 2 | 19 |
+| allocations, `all` of 16 with `limit(4)` vs `buffered(4)` | 21 | 19 |
+
+What this says:
+
+- `zip`, `race`, `timeout`, sequencing and a typical `retry(timeout(zip))` happy path have no
+  overhead that can be told apart from noise, and no extra allocations. Futures are up to 17%
+  larger.
+- `retry` is not free: about 9 ns more than `backon` when nothing fails (it reads the clock once
+  per run), and about 23 ns more per failed attempt with no delay (it reads the clock again to
+  fill the `Step`). With a real timer, the difference is about 6%. In exchange it skips the timer
+  for zero delays: `backon` with its default sleeper took 3.3 ms in the zero-delay scenario,
+  because each `sleep(0)` waits for a tick of the timer.
+- `all` is **not** zero-cost: it always goes through `FuturesUnordered`, with one allocation per
+  op. It is about nine times slower than `try_join_all` on 16 ready leaves, which is a fair price
+  only when the ops do real work. With `limit` it is on par with `buffered`.
 
 ## Related work
 

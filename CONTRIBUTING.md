@@ -26,6 +26,10 @@ cargo doc --no-deps --all-features
 CI runs all of the above on stable and on 1.88, with warnings denied
 (`RUSTFLAGS=-D warnings`).
 
+`cargo bench` compares the combinators against the same code written directly with `futures`,
+`tokio` and `backon` (`benches/`). If a change affects the numbers in the README's Performance
+section, update them.
+
 ## Style and rules
 
 - Format with `rustfmt` and keep `clippy` quiet.
