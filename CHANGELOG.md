@@ -11,9 +11,25 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Benchmarks against `futures`, `tokio` and `backon` (`benches/`). Those crates and `criterion`
   are development dependencies only.
+- Schedules with input: `ScheduleFor<In>`, `schedule::recur_while`, `schedule::recur_until`,
+  `schedule::from_input` and `Schedule::contramap`. A schedule sees the error when retrying and
+  the value when repeating.
+- `Op::repeat`: run again after each success according to a schedule.
+- `Op::hedge`: staggered copies of an op, driven by a schedule; the first success wins.
+- `zip3` to `zip8`: flat parallel products.
+- `CircuitBreaker::with_schedule`: the cool-down of each opening comes from a schedule.
+- `Clone` for `Succeed`, `Fail` and `Never`.
+- Property tests for all of the above, including `tests/breaker_laws.rs`.
 
 ### Changed
 
+- **Breaking:** `Schedule::next` moved to the new `ScheduleFor<In>` trait and takes the input
+  (`next(&input, step)`). `Schedule` keeps `fresh` and the combinators, so code that only builds
+  and combines schedules is unaffected. Implement `ScheduleFor<In>` for `In` generic to port a
+  custom schedule, and replace `S: Schedule` or `impl Schedule` with `ScheduleFor<E>` where the
+  schedule is passed to `retry`.
+- `CircuitBreaker` and `Breaker` gained a schedule type parameter with a default, so
+  `CircuitBreaker::new` and the plain type name keep working.
 - README: the "zero-cost" claim is replaced by the measured overhead (new Performance section).
 
 ## [0.1.0] - 2026-11-04

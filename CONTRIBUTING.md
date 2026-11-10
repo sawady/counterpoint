@@ -35,7 +35,8 @@ section, update them.
 - Format with `rustfmt` and keep `clippy` quiet.
 - Every combinator states its laws in its documentation and in the laws tables (crate docs
   and README), and
-  `tests/laws.rs` or `tests/schedule_laws.rs` checks them with `proptest`.
+  `tests/laws.rs`, `tests/schedule_laws.rs` or `tests/breaker_laws.rs` checks them with
+  `proptest`.
 - Tests that involve time run on tokio's paused clock (`tokio::time::pause`), never on the
   wall clock, so they are fast and deterministic.
 - Behaviour that is not a law (cancellation, concurrency limits, hooks) gets a test in

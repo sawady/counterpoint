@@ -29,7 +29,7 @@ let profile = from_fn(|| fetch_profile(user))           // a re-runnable async c
     .or(from_fn(|| profile_cache(user)))                  // fallback
     .ensure(|p| !p.name.is_empty(), |_| Error::Invalid);  // guard
 
-let config = from_fn(|| mirror_eu()).race(from_fn(|| mirror_us()));  // hedged request
+let config = from_fn(|| mirror_eu()).race(from_fn(|| mirror_us()));  // first mirror to answer
 
 let recs = all(items.map(|i| from_fn(move || recommend(i))))
     .limit(4)                                             // bounded concurrency
@@ -112,8 +112,41 @@ Build ops with `from_fn(|| async { .. })` (any async closure), `succeed(v)`, `fa
 | `ensure` | `ensure(true) ≡ id` · `ensure(p).ensure(q) ≡ ensure(p ∧ q)` |
 | `timeout` | `timeout(∞) ≡ id` · `timeout(t) ≡ id` when the op is faster · `timeout(a).timeout(b) ≡ timeout(min(a, b))` except on ties |
 | `retry` | `retry(stop()) ≡ retry(recurs(0)) ≡ id` · `succeed(a).retry(s) ≡ succeed(a)` · `retry(recurs(n))` runs at most `n + 1` times · nested retries multiply |
+| `repeat` | `repeat(stop()) ≡ id` · `fail(e).repeat(s) ≡ fail(e)` · `repeat` is `retry` with success and failure swapped · nested repeats multiply |
+| `hedge` | `hedge(stop()) ≡ id` · `succeed(a).hedge(s) ≡ succeed(a)` · a success is never slower than the primary's · with succeeding attempts, one hedge after `d` is a `race` against the second attempt delayed by `d`, except on ties · matches an independent model |
+| `zip3`…`zip8` | `zipN` is `zip(N-1)` zipped with one more op and flattened, ties included · duration is the max · fails fast |
 | `all` | equals its model (all values in order, or the earliest error) · with `limit(k)` the makespan is greedy list scheduling on `k` slots |
-| schedules | `\|`, `&`: associative, commutative, idempotent, absorptive, distributive · `stop()` / `forever()` are the bounds · `then`: associative with unit `stop()` · `cap(a).cap(b) ≡ cap(min(a, b))` · `jitter(0) ≡ id` |
+| schedules | `\|`, `&`: associative, commutative, idempotent, absorptive, distributive · `stop()` / `forever()` are the bounds · `then`: associative with unit `stop()` · `cap(a).cap(b) ≡ cap(min(a, b))` · `jitter(0) ≡ id` · all of them also hold for traces of inputs |
+| schedules with input | `contramap(id) ≡ id` · `contramap` composes and distributes over `\|`, `&`, `then` · `recur_while(true) ≡ forever()` · `recur_while(false) ≡ stop()` · `recur_until(p) ≡ recur_while(¬p)` · `m.retry(s & recur_while(p)) ≡ m.retry(s).when(p)` |
+| circuit breaker | `with_schedule(n, spaced(d)) ≡ new(n, d)` · the `k`-th consecutive opening lasts the `k`-th delay of the schedule · a stopped schedule stays open · matches an independent model |
+
+## Beyond retries
+
+Schedules also drive polling, hedging and the circuit breaker, and they can look at what happened:
+
+```rust
+// Retry only what is worth retrying, honouring the delay the server asks for.
+let policy = schedule::from_input(|e: &Error, _| match e {
+    Error::RateLimited(wait) => Some(*wait),
+    Error::Unavailable => Some(ms(50)),
+    Error::BadRequest => None,
+})
+.take(5);
+let mut call = from_fn(|| fetch()).retry(policy);
+
+// Poll until the job is done (`repeat` is `retry` for successes).
+let mut job = from_fn(|| status(id))
+    .repeat(schedule::spaced(ms(500)) & schedule::recur_until(|s: &Status| s.is_done()));
+
+// Tail latency: start a second copy if the first has not answered in 50ms.
+let mut read = from_fn(|| replica_read()).hedge(schedule::spaced(ms(50)).take(1));
+
+// Flat products of up to 8 ops of different types.
+let (user, cart, flags) = zip3(load_user, load_cart, load_flags).run().await?;
+
+// A breaker that stays open longer while the dependency stays down.
+let breaker = CircuitBreaker::with_schedule(5, schedule::exponential(ms(100)).cap(ms(30_000)));
+```
 
 ## Performance
 
@@ -156,8 +189,8 @@ What this says:
 - `zip`, `race`, `timeout`, sequencing and a typical `retry(timeout(zip))` happy path have no
   overhead that can be told apart from noise, and no extra allocations. Futures are up to 17%
   larger.
-- `retry` is not free: about 9 ns more than `backon` when nothing fails (it reads the clock once
-  per run), and about 23 ns more per failed attempt with no delay (it reads the clock again to
+- `retry` is not free: about 10 ns more than `backon` when nothing fails (it reads the clock once
+  per run), and about 22 ns more per failed attempt with no delay (it reads the clock again to
   fill the `Step`). With a real timer, the difference is about 6%. In exchange it skips the timer
   for zero delays: `backon` with its default sleeper took 3.3 ms in the zero-delay scenario,
   because each `sleep(0)` waits for a tick of the timer.
