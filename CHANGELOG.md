@@ -7,6 +7,15 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- `all` (and `limit` and `settled`) with up to 16 ops in flight no longer goes through
+  `FuturesUnordered`: the ops are polled from one pinned slice, or from a pool of `limit` slots.
+  `all` of 16 ready ops now makes 2 heap allocations per run instead of 19 and runs as fast as
+  `try_join_all` (it was nine times slower); with `limit(4)` it is seven times faster than
+  `buffered(4)`. Past 16 ops in flight it still uses `FuturesUnordered`. Laws and cancellation
+  are unchanged, and the law tests now cover both sides of the switch.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

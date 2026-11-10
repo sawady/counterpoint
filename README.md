@@ -115,7 +115,7 @@ Build ops with `from_fn(|| async { .. })` (any async closure), `succeed(v)`, `fa
 | `repeat` | `repeat(stop()) ≡ id` · `fail(e).repeat(s) ≡ fail(e)` · `repeat` is `retry` with success and failure swapped · nested repeats multiply |
 | `hedge` | `hedge(stop()) ≡ id` · `succeed(a).hedge(s) ≡ succeed(a)` · a success is never slower than the primary's · with succeeding attempts, one hedge after `d` is a `race` against the second attempt delayed by `d`, except on ties · matches an independent model |
 | `zip3`…`zip8` | `zipN` is `zip(N-1)` zipped with one more op and flattened, ties included · duration is the max · fails fast |
-| `all` | equals its model (all values in order, or the earliest error) · with `limit(k)` the makespan is greedy list scheduling on `k` slots |
+| `all` | equals its model (all values in order, or the earliest error) · with `limit(k)` the makespan is greedy list scheduling on `k` slots · `limit(k)` with `k ≥ n` is `all` · both hold on either side of the switch from a pinned slice to `FuturesUnordered` |
 | schedules | `\|`, `&`: associative, commutative, idempotent, absorptive, distributive · `stop()` / `forever()` are the bounds · `then`: associative with unit `stop()` · `cap(a).cap(b) ≡ cap(min(a, b))` · `jitter(0) ≡ id` · all of them also hold for traces of inputs |
 | schedules with input | `contramap(id) ≡ id` · `contramap` composes and distributes over `\|`, `&`, `then` · `recur_while(true) ≡ forever()` · `recur_while(false) ≡ stop()` · `recur_until(p) ≡ recur_while(¬p)` · `m.retry(s & recur_while(p)) ≡ m.retry(s).when(p)` |
 | circuit breaker | `with_schedule(n, spaced(d)) ≡ new(n, d)` · the `k`-th consecutive opening lasts the `k`-th delay of the schedule · a stopped schedule stays open · matches an independent model |
@@ -152,24 +152,24 @@ let breaker = CircuitBreaker::with_schedule(5, schedule::exponential(ms(100)).ca
 
 Benchmarks against the same orchestration written directly with `futures`, `tokio` and `backon`
 live in [`benches/`](benches) (`cargo bench`). The leaves do no work, so this is the worst case
-for any orchestration layer. Times are the median of two runs (criterion, rustc 1.94.1, 8-core
-x86-64 under WSL2) and include about 130 ns of `Runtime::block_on`; differences of a few ns are
+for any orchestration layer. Times are the median of three runs (criterion, rustc 1.94.1, 8-core
+x86-64 under WSL2) and include about 125 ns of `Runtime::block_on`; differences of a few ns are
 within the noise between runs.
 
 | Scenario | Direct | `counterpoint` |
 |---|---|---|
-| leaf (`from_fn`) | 131 ns | 130 ns |
-| `map` + `and_then` chain vs `async fn` | 132 ns | 129 ns |
-| `zip`, ready leaves vs `try_join` | 138 ns | 140 ns |
-| `zip`, yielding leaves vs `try_join` | 302 ns | 305 ns |
-| `race` vs `select` | 286 ns | 290 ns |
-| `timeout` vs `tokio::time::timeout` | 171 ns | 174 ns |
-| `retry(timeout(zip))`, happy path, vs `backon` + `tokio` + `futures` | 199 ns | 200 ns |
-| `retry`, no failure, vs `backon` | 146 ns | 155 ns |
-| `retry`, 3 failures without delay, vs `backon` with a no-op sleeper | 145 ns | 213 ns |
-| `retry`, 3 failures, 1 ms delays, paused clock, vs `backon` | 1.29 µs | 1.37 µs |
-| `all` of 16 vs `try_join_all` | 172 ns | 1.51 µs |
-| `all` of 16 with `limit(4)` vs `buffered(4)` | 1.48 µs | 1.36 µs |
+| leaf (`from_fn`) | 127 ns | 128 ns |
+| `map` + `and_then` chain vs `async fn` | 127 ns | 131 ns |
+| `zip`, ready leaves vs `try_join` | 138 ns | 141 ns |
+| `zip`, yielding leaves vs `try_join` | 306 ns | 311 ns |
+| `race` vs `select` | 289 ns | 291 ns |
+| `timeout` vs `tokio::time::timeout` | 169 ns | 171 ns |
+| `retry(timeout(zip))`, happy path, vs `backon` + `tokio` + `futures` | 190 ns | 194 ns |
+| `retry`, no failure, vs `backon` | 139 ns | 148 ns |
+| `retry`, 3 failures without delay, vs `backon` with a no-op sleeper | 143 ns | 209 ns |
+| `retry`, 3 failures, 1 ms delays, paused clock, vs `backon` | 1.28 µs | 1.37 µs |
+| `all` of 16 vs `try_join_all` | 176 ns | 177 ns |
+| `all` of 16 with `limit(4)` vs `buffered(4)` | 1.48 µs | 202 ns |
 
 Future size and heap allocations per run (`cargo bench --bench footprint`), which do not depend
 on the machine:
@@ -180,23 +180,27 @@ on the machine:
 | `race` of two yielding leaves vs `select` | 104 bytes | 112 bytes |
 | `timeout` vs `tokio::time::timeout` | 136 bytes | 152 bytes |
 | `retry` vs `backon` | 192 bytes | 176 bytes |
+| `all` of 16 vs `try_join_all` | 88 bytes | 224 bytes |
 | allocations, `zip` / `race` / `timeout` / `retry` | same as direct | same as direct |
-| allocations, `all` of 16 vs `try_join_all` | 2 | 19 |
-| allocations, `all` of 16 with `limit(4)` vs `buffered(4)` | 21 | 19 |
+| allocations, `all` of 16 vs `try_join_all` | 2 | 2 |
+| allocations, `all` of 16 with `limit(4)` vs `buffered(4)` | 21 | 2 |
 
 What this says:
 
 - `zip`, `race`, `timeout`, sequencing and a typical `retry(timeout(zip))` happy path have no
   overhead that can be told apart from noise, and no extra allocations. Futures are up to 17%
-  larger.
-- `retry` is not free: about 10 ns more than `backon` when nothing fails (it reads the clock once
+  larger, except `all`'s (see below).
+- `retry` is not free: about 9 ns more than `backon` when nothing fails (it reads the clock once
   per run), and about 22 ns more per failed attempt with no delay (it reads the clock again to
-  fill the `Step`). With a real timer, the difference is about 6%. In exchange it skips the timer
-  for zero delays: `backon` with its default sleeper took 3.3 ms in the zero-delay scenario,
+  fill the `Step`). With a real timer, the difference is about 7%. In exchange it skips the timer
+  for zero delays: `backon` with its default sleeper took 3.2 ms in the zero-delay scenario,
   because each `sleep(0)` waits for a tick of the timer.
-- `all` is **not** zero-cost: it always goes through `FuturesUnordered`, with one allocation per
-  op. It is about nine times slower than `try_join_all` on 16 ready leaves, which is a fair price
-  only when the ops do real work. With `limit` it is on par with `buffered`.
+- `all` with up to 16 ops in flight keeps them in one pinned slice: two allocations per run (the
+  slice and the output) and on par with `try_join_all`; with `limit` it is seven times faster
+  than `buffered`. Its future is larger because it holds both strategies. Past 16 ops in flight
+  it switches to `FuturesUnordered` (one allocation per op), because polling the whole slice on
+  every wake-up is quadratic when the ops finish one by one: in that worst case both strategies
+  are on par at 16 ops and the slice is about 45% slower at 32.
 
 ## Related work
 

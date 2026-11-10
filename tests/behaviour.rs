@@ -72,11 +72,11 @@ async fn dropping_a_retry_mid_backoff_stops_it() {
     assert_eq!(calls.get(), 3);
 }
 
-#[tokio::test(start_paused = true)]
-async fn all_respects_the_concurrency_limit() {
+/// Peak concurrency and running time of `all(n ops of 10ms).limit(limit)`.
+async fn peak_of_bounded_all(n: usize, limit: usize) -> (usize, Duration) {
     let running = Rc::new(Cell::new(0usize));
     let peak = Rc::new(Cell::new(0usize));
-    let ops = (0..10).map(|i| {
+    let ops = (0..n).map(|i| {
         let (running, peak) = (running.clone(), peak.clone());
         from_fn(move || {
             let (running, peak) = (running.clone(), peak.clone());
@@ -89,21 +89,57 @@ async fn all_respects_the_concurrency_limit() {
             }
         })
     });
-    let mut op = all(ops).limit(3);
+    let mut op = all(ops).limit(limit);
     let t0 = Instant::now();
-    assert_eq!(op.run().await, Ok((0..10).collect::<Vec<_>>()));
-    assert_eq!(peak.get(), 3);
-    assert_eq!(t0.elapsed(), ms(40)); // ceil(10 / 3) waves of 10ms
+    assert_eq!(op.run().await, Ok((0..n).collect::<Vec<_>>()));
+    (peak.get(), t0.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn all_respects_the_concurrency_limit() {
+    // ceil(n / limit) waves of 10ms. The second case goes through `FuturesUnordered`.
+    assert_eq!(peak_of_bounded_all(10, 3).await, (3, ms(40)));
+    assert_eq!(peak_of_bounded_all(100, 40).await, (40, ms(30)));
+}
+
+/// `all` of `n` slow ops zipped with a fast failure: every slow op must be cancelled.
+async fn fail_fast_cancels(n: usize, limit: usize) {
+    let dropped: Vec<_> = (0..n).map(|_| Rc::new(Cell::new(false))).collect();
+    let ops = (0..n).map(|i| cancellable(100, Ok(i as i32), dropped[i].clone()));
+    let failing = cancellable(5, Err(TErr::Code(1)), Rc::default());
+    let mut op = all(ops).limit(limit).zip(failing);
+    assert_eq!(op.run().await, Err(TErr::Code(1)));
+    let started = n.min(limit);
+    assert!(dropped[..started].iter().all(|d| d.get()));
 }
 
 #[tokio::test(start_paused = true)]
 async fn all_fail_fast_cancels_the_rest() {
-    let dropped: Vec<_> = (0..4).map(|_| Rc::new(Cell::new(false))).collect();
-    let ops = (0..4).map(|i| cancellable(100, Ok(i), dropped[i as usize].clone()));
-    let failing = cancellable(5, Err(TErr::Code(1)), Rc::default());
-    let mut op = all(ops).zip(failing);
-    assert_eq!(op.run().await, Err(TErr::Code(1)));
-    assert!(dropped.iter().all(|d| d.get()));
+    fail_fast_cancels(4, usize::MAX).await; // one pinned slice
+    fail_fast_cancels(40, usize::MAX).await; // `FuturesUnordered`
+    fail_fast_cancels(10, 3).await; // pool of slots
+    fail_fast_cancels(80, 40).await; // `FuturesUnordered` with a limit
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_error_inside_all_cancels_its_siblings() {
+    for n in [4usize, 40] {
+        let dropped: Vec<_> = (0..n).map(|_| Rc::new(Cell::new(false))).collect();
+        let ops = (0..n).map(|i| {
+            let out = if i == n - 1 {
+                Err(TErr::Code(2))
+            } else {
+                Ok(i as i32)
+            };
+            let d = if i == n - 1 { 5 } else { 100 };
+            cancellable(d, out, dropped[i].clone())
+        });
+        let mut op = all(ops);
+        let t0 = Instant::now();
+        assert_eq!(op.run().await, Err(TErr::Code(2)));
+        assert_eq!(t0.elapsed(), ms(5));
+        assert!(dropped[..n - 1].iter().all(|d| d.get()));
+    }
 }
 
 #[tokio::test(start_paused = true)]

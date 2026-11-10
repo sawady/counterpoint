@@ -22,6 +22,57 @@ fn unit() -> impl Op<Ok = (), Err = TErr> {
     succeed(())
 }
 
+/// Model of `all`: success iff every leaf succeeds, taking the max duration; otherwise the
+/// earliest failure wins and cancels the rest.
+fn all_model(leaves: &[Leaf]) -> Result<(), TestCaseError> {
+    let (r, t) = observe(all(leaves.iter().map(|l| l.op())));
+    let first_failure = leaves.iter().filter(|l| !l.ok()).map(|l| l.delay_ms).min();
+    match first_failure {
+        None => {
+            prop_assert_eq!(
+                r,
+                Ok(leaves.iter().map(|l| l.result.unwrap()).collect::<Vec<_>>())
+            );
+            prop_assert_eq!(t, ms(leaves.iter().map(|l| l.delay_ms).max().unwrap_or(0)));
+        }
+        Some(d) => {
+            prop_assert_eq!(t, ms(d));
+            let at_d: Vec<_> = leaves
+                .iter()
+                .filter(|l| !l.ok() && l.delay_ms == d)
+                .collect();
+            if at_d.len() == 1 {
+                prop_assert_eq!(r, Err(at_d[0].result.unwrap_err()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bounded `all` of successful leaves: values in input order, and the makespan of greedy list
+/// scheduling in input order on `limit` slots.
+fn list_scheduling(leaves: Vec<Leaf>, limit: usize) -> Result<(), TestCaseError> {
+    let leaves: Vec<_> = leaves
+        .into_iter()
+        .map(|l| Leaf {
+            result: Ok(l.delay_ms as i32),
+            ..l
+        })
+        .collect();
+    let (r, t) = observe(all(leaves.iter().map(|l| l.op())).limit(limit));
+    let mut slots = vec![0u64; limit];
+    for l in &leaves {
+        let s = slots.iter_mut().min().unwrap();
+        *s += l.delay_ms;
+    }
+    prop_assert_eq!(
+        r,
+        Ok(leaves.iter().map(|l| l.delay_ms as i32).collect::<Vec<_>>())
+    );
+    prop_assert_eq!(t, ms(slots.into_iter().max().unwrap_or(0)));
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -117,43 +168,42 @@ proptest! {
 
     #[test]
     fn all_matches_its_model(leaves in prop::collection::vec(leaf(), 0..7)) {
-        // Model: success iff every leaf succeeds, taking the max duration; otherwise the
-        // earliest failure wins and cancels the rest.
-        let (r, t) = observe(all(leaves.iter().map(|l| l.op())));
-        let first_failure = leaves.iter().filter(|l| !l.ok()).map(|l| l.delay_ms).min();
-        match first_failure {
-            None => {
-                prop_assert_eq!(r, Ok(leaves.iter().map(|l| l.result.unwrap()).collect::<Vec<_>>()));
-                prop_assert_eq!(t, ms(leaves.iter().map(|l| l.delay_ms).max().unwrap_or(0)));
-            }
-            Some(d) => {
-                prop_assert_eq!(t, ms(d));
-                let at_d: Vec<_> = leaves.iter().filter(|l| !l.ok() && l.delay_ms == d).collect();
-                if at_d.len() == 1 {
-                    prop_assert_eq!(r, Err(at_d[0].result.unwrap_err()));
-                }
-            }
-        }
+        all_model(&leaves)?;
+    }
+
+    #[test]
+    fn all_matches_its_model_past_the_small_path(leaves in prop::collection::vec(leaf(), 10..30)) {
+        // Crosses the size at which `all` switches from polling a slice to `FuturesUnordered`.
+        all_model(&leaves)?;
+    }
+
+    #[test]
+    fn all_with_a_limit_of_at_least_its_length_is_all(leaves in prop::collection::vec(leaf(), 0..30), extra in 0usize..3) {
+        same(all(leaves.iter().map(|l| l.op())).limit(leaves.len().max(1) + extra), all(leaves.iter().map(|l| l.op())))?;
     }
 
     #[test]
     fn bounded_all_is_list_scheduling(leaves in prop::collection::vec(leaf(), 0..7), limit in 1usize..4) {
-        let leaves: Vec<_> = leaves.into_iter().map(|l| Leaf { result: Ok(l.delay_ms as i32), ..l }).collect();
-        let (r, t) = observe(all(leaves.iter().map(|l| l.op())).limit(limit));
-        // Greedy list scheduling in input order on `limit` slots.
-        let mut slots = vec![0u64; limit];
-        for l in &leaves {
-            let s = slots.iter_mut().min().unwrap();
-            *s += l.delay_ms;
-        }
-        prop_assert_eq!(r, Ok(leaves.iter().map(|l| l.delay_ms as i32).collect::<Vec<_>>()));
-        prop_assert_eq!(t, ms(slots.into_iter().max().unwrap_or(0)));
+        list_scheduling(leaves, limit)?;
+    }
+
+    #[test]
+    fn bounded_all_is_list_scheduling_with_wide_limits(leaves in prop::collection::vec(leaf(), 20..40), limit in 12usize..24) {
+        // Limits on both sides of the switch to `FuturesUnordered`.
+        list_scheduling(leaves, limit)?;
     }
 
     #[test]
     fn settled_reports_everything(leaves in prop::collection::vec(leaf(), 0..7), limit in 1usize..4) {
         let (r, _) = observe(all(leaves.iter().map(|l| l.op())).limit(limit).settled());
         prop_assert_eq!(r, Ok(leaves.iter().map(|l| l.result).collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn settled_reports_everything_and_takes_the_max(leaves in prop::collection::vec(leaf(), 0..30)) {
+        let (r, t) = observe(all(leaves.iter().map(|l| l.op())).settled());
+        prop_assert_eq!(r, Ok(leaves.iter().map(|l| l.result).collect::<Vec<_>>()));
+        prop_assert_eq!(t, ms(leaves.iter().map(|l| l.delay_ms).max().unwrap_or(0)));
     }
 
     // ----- race -------------------------------------------------------------------------
