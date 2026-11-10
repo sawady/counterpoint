@@ -7,6 +7,8 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-10
+
 ### Added
 
 - Benchmarks against `futures`, `tokio` and `backon` (`benches/`). Those crates and `criterion`
@@ -56,5 +58,6 @@ First release.
 - CI: fmt, clippy, tests on stable and on the MSRV (1.88), and docs.
 - `CONTRIBUTING.md` and this changelog.
 
-[Unreleased]: https://github.com/sawady/counterpoint/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sawady/counterpoint/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sawady/counterpoint/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sawady/counterpoint/releases/tag/v0.1.0

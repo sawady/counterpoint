@@ -11,7 +11,7 @@ happen — in sequence, in parallel, as a race, with timeouts, retries, fallback
 with a small set of combinators whose behaviour is pinned down by **algebraic laws**, and every
 law is checked by property-based tests on tokio's virtual clock.
 
-> Status: early release (0.1). The API may still change between 0.x versions.
+> Status: early release (0.2). The API may still change between 0.x versions.
 
 ```rust
 use counterpoint::prelude::*;
@@ -46,7 +46,7 @@ A complete, runnable version lives in [`examples/dashboard.rs`](examples/dashboa
 
 ```toml
 [dependencies]
-counterpoint = "0.1"
+counterpoint = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 ```
 
