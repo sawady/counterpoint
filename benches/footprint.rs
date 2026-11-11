@@ -131,6 +131,14 @@ fn main() {
     let mut op = all((0..16).map(|i| from_fn(move || leaf(i)))).limit(4);
     row!(rt, "all(16).limit(4) / counterpoint", op.run());
 
+    row!(rt, "race_all(16) / futures::select_all", async {
+        future::select_all((0..16).map(|i| Box::pin(yielding(i))))
+            .await
+            .0
+    });
+    let mut op = race_all((0..16).map(|i| from_fn(move || yielding(i))));
+    row!(rt, "race_all(16) / counterpoint", op.run());
+
     row!(rt, "timeout / tokio", async {
         tokio::time::timeout(FAR, leaf(1)).await.map_err(|_| E)?
     });

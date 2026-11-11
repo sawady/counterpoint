@@ -125,6 +125,21 @@ fn parallel(c: &mut Criterion) {
     let mut op = all((0..16).map(|i| from_fn(move || leaf(i)))).limit(4);
     g.bench_function("counterpoint", |b| b.iter(|| rt.block_on(op.run())));
     g.finish();
+
+    // Every leaf yields once, so all 16 are started before the first one wins.
+    let mut g = c.benchmark_group("race_all_16");
+    g.bench_function("futures_select_all", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                future::select_all((0..16).map(|i| Box::pin(yielding(i))))
+                    .await
+                    .0
+            })
+        })
+    });
+    let mut op = race_all((0..16).map(|i| from_fn(move || yielding(i))));
+    g.bench_function("counterpoint", |b| b.iter(|| rt.block_on(op.run())));
+    g.finish();
 }
 
 fn resilience(c: &mut Criterion) {

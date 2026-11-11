@@ -108,6 +108,7 @@ Build ops with `from_fn(|| async { .. })` (any async closure), `succeed(v)`, `fa
 | `zip` | associative and commutative up to tuple isomorphism · unit `succeed(())` · duration is the max · fails fast |
 | `join` | never fails · duration is the max |
 | `race` | associative · identity `never()` · commutative except on ties · duration is the min |
+| `race_all` | equals its model (the fastest op wins, at its duration) on either side of the switch to `FuturesUnordered` · up to 16 ops it is iterated `race`, ties included · the empty `race_all` is the identity of `race` |
 | `or` | associative · left identity `fail(e)` · left zero `succeed(a)` · *no* right identity |
 | `ensure` | `ensure(true) ≡ id` · `ensure(p).ensure(q) ≡ ensure(p ∧ q)` |
 | `timeout` | `timeout(∞) ≡ id` · `timeout(t) ≡ id` when the op is faster · `timeout(a).timeout(b) ≡ timeout(min(a, b))` except on ties |
@@ -176,6 +177,7 @@ within the noise between runs.
 | `retry`, 3 failures, 1 ms delays, paused clock, vs `backon` | 1.28 µs | 1.37 µs |
 | `all` of 16 vs `try_join_all` | 176 ns | 177 ns |
 | `all` of 16 with `limit(4)` vs `buffered(4)` | 1.48 µs | 202 ns |
+| `race_all` of 16 yielding leaves vs `select_all` | 731 ns | 620 ns |
 
 Future size and heap allocations per run (`cargo bench --bench footprint`), which do not depend
 on the machine:
@@ -187,9 +189,11 @@ on the machine:
 | `timeout` vs `tokio::time::timeout` | 136 bytes | 152 bytes |
 | `retry` vs `backon` | 192 bytes | 176 bytes |
 | `all` of 16 vs `try_join_all` | 88 bytes | 224 bytes |
+| `race_all` of 16 vs `select_all` | 32 bytes | 80 bytes |
 | allocations, `zip` / `race` / `timeout` / `retry` | same as direct | same as direct |
 | allocations, `all` of 16 vs `try_join_all` | 2 | 2 |
 | allocations, `all` of 16 with `limit(4)` vs `buffered(4)` | 21 | 2 |
+| allocations, `race_all` of 16 vs `select_all` (3 of them are the leaves' `yield_now` in both) | 20 | 4 |
 
 What this says:
 
@@ -207,6 +211,9 @@ What this says:
   it switches to `FuturesUnordered` (one allocation per op), because polling the whole slice on
   every wake-up is quadratic when the ops finish one by one: in that worst case both strategies
   are on par at 16 ops and the slice is about 45% slower at 32.
+- `race_all` uses the same pinned slice up to 16 ops: one allocation for the futures, where
+  `select_all` boxes each one. It went from 2.36 µs and 21 allocations (through
+  `FuturesUnordered`) to 620 ns and 4, about 15% faster than `select_all`.
 
 ## Related work
 

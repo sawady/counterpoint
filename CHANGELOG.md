@@ -7,6 +7,16 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- `race_all` with up to 16 ops no longer goes through `FuturesUnordered`: the ops are polled
+  from one pinned slice, in input order. A race of 16 yielding ops now makes one allocation for
+  the futures instead of one per op (4 heap allocations per run instead of 21, three of them
+  from the leaves) and takes 620 ns instead of 2.36 µs, about 15% less than
+  `futures::future::select_all`. Exact ties go to the earliest op, as with iterated `race`.
+  Past 16 ops it still uses `FuturesUnordered`. No new `unsafe`: it reuses the pin projection of
+  `all`. Laws and cancellation are unchanged, and the tests cover both sides of the switch.
+
 ## [0.2.1] - 2026-11-11
 
 ### Added

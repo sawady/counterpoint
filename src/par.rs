@@ -375,7 +375,8 @@ impl<O> All<O> {
 }
 
 /// Up to this many ops in flight, `all` keeps them in one pinned slice and polls every one of
-/// them on each wake-up, which costs two allocations per run in total. Past it, they go through
+/// them on each wake-up, which costs two allocations per run in total (one for `race_all`, which
+/// has no output to collect). Past it, they go through
 /// `FuturesUnordered`, which allocates once per op but only polls the ones that were woken:
 /// polling everything is quadratic when the ops finish one by one.
 ///
@@ -565,6 +566,11 @@ impl<O: Op> Op for AllSettled<O> {
 
 /// Race a collection: the first op to finish wins and the rest are cancelled. An empty race
 /// never completes (it is [`never()`](fn@crate::never)(crate::never), the identity of racing).
+///
+/// Like [`All`], up to 16 ops are kept in one pinned slice (one allocation per run) and polled
+/// in input order, so an exact tie goes to the op that comes first, as with iterated
+/// [`Op::race`]. Past 16 they go through `FuturesUnordered`, and which of the tied ops wins is
+/// unspecified.
 #[derive(Clone)]
 #[must_use = "ops do nothing until `.run().await`"]
 pub struct RaceAll<O> {
@@ -587,6 +593,21 @@ impl<O: Op> Op for RaceAll<O> {
     type Err = O::Err;
 
     async fn run(&mut self) -> Result<O::Ok, O::Err> {
+        if self.ops.len() <= SMALL {
+            // The first op to finish returns at once; dropping `slots` cancels the rest. An
+            // empty slice is never ready, which is `never()`.
+            let mut slots: Pin<Box<[_]>> =
+                Box::into_pin(self.ops.iter_mut().map(|op| op.run()).collect());
+            return poll_fn(move |cx| {
+                for slot in each_pinned(slots.as_mut()) {
+                    if let Poll::Ready(result) = slot.poll(cx) {
+                        return Poll::Ready(result);
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+        }
         let mut running: FuturesUnordered<_> = self
             .ops
             .iter_mut()

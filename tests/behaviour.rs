@@ -163,6 +163,26 @@ async fn race_all_picks_the_fastest() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn race_all_cancels_the_losers() {
+    // A pinned slice, then `FuturesUnordered`.
+    for n in [4usize, 40] {
+        let dropped: Vec<_> = (0..n).map(|_| Rc::new(Cell::new(false))).collect();
+        let winner = n / 2;
+        let ops = (0..n).map(|i| {
+            let d = if i == winner { 5 } else { 100 };
+            cancellable(d, Ok(i as i32), dropped[i].clone())
+        });
+        let mut op = race_all(ops);
+        let t0 = Instant::now();
+        assert_eq!(op.run().await, Ok(winner as i32));
+        assert_eq!(t0.elapsed(), ms(5));
+        for (i, d) in dropped.iter().enumerate() {
+            assert_eq!(d.get(), i != winner, "op {i}");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn retry_hook_and_filter() {
     let log = Rc::new(RefCell::new(Vec::new()));
     let l = log.clone();

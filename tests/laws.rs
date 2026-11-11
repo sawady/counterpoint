@@ -49,6 +49,22 @@ fn all_model(leaves: &[Leaf]) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// Model of `race_all` over a non-empty collection: the fastest leaf wins, at its delay. With
+/// `ties_to_first`, an exact tie goes to the earliest leaf; otherwise the result is one of the
+/// tied leaves.
+fn race_all_model(leaves: &[Leaf], ties_to_first: bool) -> Result<(), TestCaseError> {
+    let (r, t) = observe(race_all(leaves.iter().map(|l| l.op())));
+    let d = leaves.iter().map(|l| l.delay_ms).min().expect("non-empty");
+    prop_assert_eq!(t, ms(d));
+    let mut tied = leaves.iter().filter(|l| l.delay_ms == d).map(|l| l.result);
+    if ties_to_first {
+        prop_assert_eq!(Some(r), tied.next());
+    } else {
+        prop_assert!(tied.any(|x| x == r));
+    }
+    Ok(())
+}
+
 /// Bounded `all` of successful leaves: values in input order, and the makespan of greedy list
 /// scheduling in input order on `limit` slots.
 fn list_scheduling(leaves: Vec<Leaf>, limit: usize) -> Result<(), TestCaseError> {
@@ -235,9 +251,25 @@ proptest! {
 
     #[test]
     fn race_all_is_iterated_race(a in leaf(), b in leaf(), c in leaf()) {
-        let ds = [a.delay_ms, b.delay_ms, c.delay_ms];
-        prop_assume!(ds[0] != ds[1] && ds[1] != ds[2] && ds[0] != ds[2]);
+        // Ties included: on the pinned-slice path they go to the earliest op, like `race`.
         same(race_all([a.op(), b.op(), c.op()]), a.op().race(b.op()).race(c.op()))?;
+    }
+
+    #[test]
+    fn race_all_matches_its_model(leaves in prop::collection::vec(leaf(), 1..=16)) {
+        race_all_model(&leaves, true)?;
+    }
+
+    #[test]
+    fn race_all_matches_its_model_past_the_small_path(leaves in prop::collection::vec(leaf(), 10..40)) {
+        // Crosses the size at which `race_all` switches from a slice to `FuturesUnordered`.
+        race_all_model(&leaves, leaves.len() <= 16)?;
+    }
+
+    #[test]
+    fn empty_race_all_is_the_identity_of_race(a in leaf()) {
+        same(race_all(Vec::<Leaf>::new().into_iter().map(|l| l.op())).race(a.op()), a.op())?;
+        same(a.op().race(race_all(Vec::<Leaf>::new().into_iter().map(|l| l.op()))), a.op())?;
     }
 
     // ----- alternatives & guards ---------------------------------------------------------
