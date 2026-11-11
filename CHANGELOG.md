@@ -7,6 +7,18 @@ project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- `breaker::Verdict` (`Failure`, `Success`, `Neutral`): the predicate of `Breaker::when` may now
+  return a `Verdict` instead of a `bool`, to count some errors as a success, such as a "not
+  found" from a healthy service. Such an error resets the consecutive failures and closes the
+  circuit when it ends a half-open probe; the caller still gets the error. A `bool` keeps its
+  meaning (`true` is `Failure`, `false` is `Neutral`).
+- `CountIf::verdict`, a provided method that defaults to `counts`, so existing implementations
+  of `CountIf` keep working unchanged.
+- Property tests against the model of the breaker's state machine with three-way
+  classification, half-open probes included.
+
 ### Changed
 
 - `race_all` with up to 16 ops no longer goes through `FuturesUnordered`: the ops are polled

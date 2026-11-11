@@ -119,7 +119,7 @@ Build ops with `from_fn(|| async { .. })` (any async closure), `succeed(v)`, `fa
 | `all` | equals its model (all values in order, or the earliest error) · with `limit(k)` the makespan is greedy list scheduling on `k` slots · `limit(k)` with `k ≥ n` is `all` · both hold on either side of the switch from a pinned slice to `FuturesUnordered` |
 | schedules | `\|`, `&`: associative, commutative, idempotent, absorptive, distributive · `stop()` / `forever()` are the bounds · `then`: associative with unit `stop()` · `cap(a).cap(b) ≡ cap(min(a, b))` · `jitter(0) ≡ id` · all of them also hold for traces of inputs |
 | schedules with input | `contramap(id) ≡ id` · `contramap` composes and distributes over `\|`, `&`, `then` · `recur_while(true) ≡ forever()` · `recur_while(false) ≡ stop()` · `recur_until(p) ≡ recur_while(¬p)` · `m.retry(s & recur_while(p)) ≡ m.retry(s).when(p)` |
-| circuit breaker | `with_schedule(n, spaced(d)) ≡ new(n, d)` · the `k`-th consecutive opening lasts the `k`-th delay of the schedule · a stopped schedule stays open · matches an independent model · `.when(|_| true) ≡` no filter · with `.when(|_| false)` it never opens · calls whose error `.when` does not count can be removed from a trace without changing anything else |
+| circuit breaker | `with_schedule(n, spaced(d)) ≡ new(n, d)` · the `k`-th consecutive opening lasts the `k`-th delay of the schedule · a stopped schedule stays open · matches an independent model · `.when(|_| true) ≡` no filter · with `.when(|_| false)` it never opens · calls whose error `.when` does not count can be removed from a trace without changing anything else · with a three-way `Verdict` it matches the model, half-open probes included · an error with `Verdict::Success` is a success to the breaker · a `bool` predicate `p` is the verdict `p(e).into()` |
 
 ## Beyond retries
 
@@ -153,6 +153,14 @@ let breaker = CircuitBreaker::with_schedule(5, schedule::exponential(ms(100)).ca
 // A rejected request says nothing about the health of the dependency: it does not count.
 let mut pay = from_fn(|| charge()).with_breaker(breaker.clone())
     .when(|e: &Error| !matches!(e, Error::BadRequest));
+// A "not found" even proves the service is up: count it as a success
+// (`Verdict` is `counterpoint::breaker::Verdict`).
+let mut lookup = from_fn(|| find(id)).with_breaker(breaker.clone())
+    .when(|e: &Error| match e {
+        Error::Unavailable => Verdict::Failure,
+        Error::NotFound => Verdict::Success,
+        _ => Verdict::Neutral,
+    });
 ```
 
 ## Performance

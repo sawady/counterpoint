@@ -8,7 +8,8 @@
 //! never wedges the breaker.
 //!
 //! By default every error counts as a failure. [`Breaker::when`] picks the ones that do: the
-//! others are neutral, as if the call had not been made.
+//! others are neutral, as if the call had not been made, or, with a [`Verdict`], count as a
+//! success (an error that proves the dependency is up, such as a 404).
 //!
 //! The cool-down is a [`Schedule`](crate::schedule::Schedule): [`CircuitBreaker::new`] uses a
 //! fixed one and [`CircuitBreaker::with_schedule`] accepts any, so a breaker can back off while
@@ -24,12 +25,46 @@ use crate::op::Op;
 use crate::retry::Always;
 use crate::schedule::{self, ScheduleFor, Spaced, Step};
 
-/// Decides whether an error counts as a failure for the breaker. Implemented by
-/// [`Always`] (every error counts, the default) and by any
-/// `FnMut(&E) -> bool`.
+/// What an error says about the dependency behind a breaker. See [`Breaker::when`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Verdict {
+    /// The dependency failed: the error adds to the consecutive failures, and a half-open probe
+    /// that ends with it opens the circuit again.
+    Failure,
+    /// The dependency is up, even though the call failed (a "not found" from a healthy service):
+    /// the error resets the consecutive failures like a success, and a half-open probe that ends
+    /// with it closes the circuit. The caller still gets the error.
+    Success,
+    /// The error says nothing about the dependency (a rejected request): the breaker is left as
+    /// it was, and a half-open probe that ends with it gives its slot back.
+    Neutral,
+}
+
+/// `true` is a [`Verdict::Failure`] and `false` a [`Verdict::Neutral`], which is how a
+/// `bool` predicate passed to [`Breaker::when`] is read.
+impl From<bool> for Verdict {
+    fn from(counts: bool) -> Self {
+        if counts {
+            Verdict::Failure
+        } else {
+            Verdict::Neutral
+        }
+    }
+}
+
+/// Decides what an error means for the breaker. Implemented by [`Always`] (every error counts,
+/// the default) and by any `FnMut(&E) -> R` where `R: Into<Verdict>`: a `bool` (count it or
+/// not) or a [`Verdict`].
 pub trait CountIf<E> {
-    /// `true` if `error` is a failure of the dependency, `false` to leave the breaker as it was.
+    /// `true` if `error` is a failure of the dependency, `false` otherwise.
     fn counts(&mut self, error: &E) -> bool;
+
+    /// The full classification of `error`; the breaker only asks this. By default
+    /// [`Verdict::Failure`] when [`counts`](CountIf::counts) and [`Verdict::Neutral`]
+    /// otherwise, so implementations of `counts` alone keep their meaning.
+    fn verdict(&mut self, error: &E) -> Verdict {
+        self.counts(error).into()
+    }
 }
 
 impl<E> CountIf<E> for Always {
@@ -38,9 +73,17 @@ impl<E> CountIf<E> for Always {
     }
 }
 
-impl<E, F: FnMut(&E) -> bool> CountIf<E> for F {
+impl<E, F, R> CountIf<E> for F
+where
+    F: FnMut(&E) -> R,
+    R: Into<Verdict>,
+{
     fn counts(&mut self, error: &E) -> bool {
-        self(error)
+        self.verdict(error) == Verdict::Failure
+    }
+
+    fn verdict(&mut self, error: &E) -> Verdict {
+        self(error).into()
     }
 }
 
@@ -313,9 +356,15 @@ impl<O, S, W> Breaker<O, S, W> {
     /// The classification belongs to the op, not to the breaker: ops sharing a breaker may
     /// classify differently. Rejections with [`CircuitOpen`] are not seen by `pred`.
     ///
+    /// `pred` may also return a [`Verdict`], to count some errors as a *success*: they prove
+    /// that the dependency is up, so they reset the consecutive failures and a half-open probe
+    /// that ends with one closes the circuit. A `bool` reads as `Failure` / `Neutral`.
+    ///
     /// Laws: `.when(|_| true) ≡` no filter; with `.when(|_| false)` a closed breaker never
     /// opens; removing the calls that end with an uncounted error from a trace changes nothing
-    /// for the other calls.
+    /// for the other calls; for the breaker, an error with [`Verdict::Success`] is a success
+    /// (replacing those calls with successes leaves every state unchanged); a `bool` predicate
+    /// `p` is the verdict `p(e).into()`.
     ///
     /// ```
     /// use counterpoint::prelude::*;
@@ -331,6 +380,38 @@ impl<O, S, W> Breaker<O, S, W> {
     ///     .with_breaker(breaker.clone())
     ///     .when(|e: &Error| *e == Error::Unavailable);
     /// assert_eq!(call.run().await, Err(Error::BadRequest));
+    /// assert_eq!(breaker.state(), BreakerState::Closed);
+    /// # }
+    /// ```
+    ///
+    /// With a [`Verdict`], a "not found" proves the service is up:
+    ///
+    /// ```
+    /// use counterpoint::breaker::Verdict;
+    /// use counterpoint::prelude::*;
+    /// use std::time::Duration;
+    ///
+    /// #[derive(Debug, Clone, PartialEq)]
+    /// enum Error { Unavailable, NotFound, BadRequest, Open }
+    /// impl From<CircuitOpen> for Error { fn from(_: CircuitOpen) -> Self { Error::Open } }
+    ///
+    /// # #[tokio::main(flavor = "current_thread", start_paused = true)] async fn main() {
+    /// let breaker = CircuitBreaker::new(1, Duration::from_secs(10));
+    /// let classify = |e: &Error| match e {
+    ///     Error::Unavailable => Verdict::Failure,
+    ///     Error::NotFound => Verdict::Success,
+    ///     Error::BadRequest | Error::Open => Verdict::Neutral,
+    /// };
+    /// let mut down = from_fn(|| async { Err::<(), _>(Error::Unavailable) })
+    ///     .with_breaker(breaker.clone())
+    ///     .when(classify);
+    /// let mut missing = from_fn(|| async { Err::<(), _>(Error::NotFound) })
+    ///     .with_breaker(breaker.clone())
+    ///     .when(classify);
+    /// assert_eq!(down.run().await, Err(Error::Unavailable));
+    /// assert_eq!(breaker.state(), BreakerState::Open);
+    /// tokio::time::sleep(Duration::from_secs(10)).await;
+    /// assert_eq!(missing.run().await, Err(Error::NotFound)); // the probe
     /// assert_eq!(breaker.state(), BreakerState::Closed);
     /// # }
     /// ```
@@ -358,8 +439,11 @@ where
         let result = self.op.run().await;
         let outcome = match &result {
             Ok(_) => Outcome::Success,
-            Err(e) if self.when.counts(e) => Outcome::Failure,
-            Err(_) => Outcome::Ignored,
+            Err(e) => match self.when.verdict(e) {
+                Verdict::Failure => Outcome::Failure,
+                Verdict::Success => Outcome::Success,
+                Verdict::Neutral => Outcome::Ignored,
+            },
         };
         permit.settle(outcome);
         result
